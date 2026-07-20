@@ -1,0 +1,43 @@
+server:
+  port: 8088
+
+spring:
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 20MB
+
+vision:
+  camera:
+    # mock | opencv | hikvision | basler
+    provider: hikvision
+    device-id: 0
+    exposure-us: 10000
+    gain: 1.0
+    trigger-mode: software
+    # provider=hikvision 时，Python 采图 sidecar 地址（hik_camera_server.py）
+    bridge-url: http://127.0.0.1:5000
+  template:
+    base-dir: ./data/templates
+  capture:
+    output-dir: ./data/captures
+  compare:
+    # template_match | ssim | hybrid
+    algorithm: hybrid
+    similarity-threshold: 0.92
+    max-offset-pixels: 30
+    enable-roi: true
+  signal:
+    enabled: true
+    ok-gpio-pin: 1
+    ng-gpio-pin: 2
+  # 对接海康 VisionMaster：Java 作为 TCP 服务端接收 VM 推送的检测结果
+  vm:
+    enabled: true
+    tcp-port: 9000
+    # VM 输出的标注图目录（用于拷进采图目录供网页展示，可空）
+    image-dir: ""
+
+logging:
+  level:
+    com.vision.inspect: INFO

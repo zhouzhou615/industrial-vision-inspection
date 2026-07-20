@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>工业视觉比对检测系统</title>
+<style>
+  :root{
+    --bg:#0f1721; --panel:#17212e; --panel2:#1e2a38; --line:#2c3a4b;
+    --txt:#e6edf3; --muted:#8aa0b4; --accent:#2f81f7;
+    --ok:#2ea043; --ng:#e5484d; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--txt)}
+  header{padding:14px 24px;background:linear-gradient(90deg,#13202e,#17212e);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px}
+  header h1{font-size:18px;margin:0;font-weight:600}
+  header .ver{color:var(--muted);font-size:12px}
+  .wrap{display:grid;grid-template-columns:380px 1fr;gap:16px;padding:16px;max-width:1500px;margin:0 auto}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 12px;color:var(--accent);font-weight:600;letter-spacing:.5px}
+  label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+  input[type=text],input[type=number],select{width:100%;padding:8px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--txt);font-size:13px}
+  input[type=file]{font-size:12px;color:var(--muted)}
+  .row{display:flex;gap:8px}
+  .row>*{flex:1}
+  button{cursor:pointer;border:none;border-radius:6px;padding:9px 14px;font-size:13px;font-weight:600;color:#fff;background:var(--accent);transition:.15s;margin-top:10px;width:100%}
+  button:hover{filter:brightness(1.1)}
+  button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--txt)}
+  button.on{background:var(--warn);color:#1a1a1a}
+  .hint{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.5}
+  .tabs{display:flex;gap:6px;margin-bottom:10px}
+  .tabs button{margin:0;flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+  .tabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .canvas-box{position:relative;background:#0a1018;border:1px solid var(--line);border-radius:8px;overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:280px}
+  canvas{max-width:100%;display:block;cursor:crosshair}
+  .result-banner{font-size:44px;font-weight:800;text-align:center;padding:20px;border-radius:10px;letter-spacing:4px}
+  .result-banner.ok{background:rgba(46,160,67,.12);color:var(--ok);border:1px solid var(--ok)}
+  .result-banner.ng{background:rgba(229,72,77,.12);color:var(--ng);border:1px solid var(--ng)}
+  .result-banner.idle{background:var(--panel2);color:var(--muted);border:1px dashed var(--line);font-size:20px;font-weight:600;letter-spacing:2px}
+  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
+  .metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .metric .k{font-size:11px;color:var(--muted)}
+  .metric .v{font-size:18px;font-weight:700;margin-top:2px}
+  .defects{margin-top:12px}
+  .defects .d{display:flex;align-items:center;gap:8px;background:rgba(229,72,77,.08);border:1px solid var(--ng);border-radius:6px;padding:8px 10px;margin-bottom:6px;font-size:13px}
+  .defects .idx{width:22px;height:22px;border-radius:50%;background:var(--ng);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;flex:0 0 22px}
+  .images{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:14px}
+  .images figure{margin:0;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px;text-align:center}
+  .images img{width:100%;height:260px;object-fit:contain;background:#0a1018;border-radius:4px}
+  .images figcaption{font-size:11px;color:var(--muted);margin-top:6px}
+  .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:12px;max-height:520px;overflow-y:auto;padding-right:4px}
+  .gcard{background:var(--panel2);border:1px solid var(--line);border-radius:8px;overflow:hidden;position:relative}
+  .gcard.ok{border-color:var(--ok)} .gcard.ng{border-color:var(--ng)}
+  .gcard img{width:100%;height:120px;object-fit:contain;background:#0a1018;display:block}
+  .gcard .tag{position:absolute;top:6px;left:6px;font-size:11px;font-weight:700;color:#fff;padding:1px 7px;border-radius:10px}
+  .gcard .tag.ok{background:var(--ok)} .gcard .tag.ng{background:var(--ng)}
+  .gcard .seq{position:absolute;top:6px;right:6px;font-size:10px;color:var(--muted);background:rgba(0,0,0,.5);padding:1px 6px;border-radius:8px}
+  .gcard .meta{padding:6px 8px;font-size:11px;color:var(--muted);line-height:1.4}
+  .gcard .meta b{color:var(--txt)}
+  .toast{position:fixed;right:18px;bottom:18px;background:var(--panel2);border:1px solid var(--line);border-left:4px solid var(--accent);padding:12px 16px;border-radius:6px;font-size:13px;opacity:0;transform:translateY(10px);transition:.25s;max-width:340px;z-index:9}
+  .toast.show{opacity:1;transform:translateY(0)}
+  .toast.err{border-left-color:var(--ng)} .toast.ok{border-left-color:var(--ok)}
+  .badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+  hr{border:none;border-top:1px solid var(--line);margin:14px 0}
+  .alarm{display:none;margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(229,72,77,.15);border:1px solid var(--ng);color:#ffb4b4;font-weight:600;font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🔍 工业视觉比对检测系统</h1>
+  <span class="ver">V2.0 · 螺丝漏打 / Logo 歪斜检测</span>
+  <span style="flex:1"></span>
+  <span class="badge" id="camBadge">相机: --</span>
+</header>
+
+<div class="wrap">
+  <!-- 左侧操作面板 -->
+  <div>
+    <div class="card">
+      <h2>① 产品 / 标准图</h2>
+      <label>产品编码</label>
+      <div class="row">
+        <input type="text" id="productCode" placeholder="如 SKU-001" value="SKU-001"/>
+        <button class="ghost" style="flex:0 0 90px" onclick="loadTemplates()">刷新</button>
+      </div>
+      <label>已注册产品</label>
+      <select id="templateList" onchange="onPickTemplate()"><option value="">—</option></select>
+      <hr/>
+      <label>上传标准图（合格 OK 样品）</label>
+      <input type="file" id="templateFile" accept="image/*"/>
+      <button onclick="registerTemplate()">注册 / 更新标准图</button>
+    </div>
+
+    <div class="card">
+      <h2>② 示教检测项</h2>
+      <div class="hint">在右侧标准图上：<b>点击</b>=添加一个螺丝位；<b>拖拽</b>=框选 Logo 区（先点下面按钮切换）。</div>
+      <div class="row">
+        <button id="btnScrew" class="on" onclick="setMode('screw')">➕ 加螺丝位</button>
+        <button id="btnLogo" class="ghost" onclick="setMode('logo')">▭ 框 Logo 区</button>
+      </div>
+      <label>螺丝检测半径（像素）</label>
+      <input type="number" id="screwR" value="20"/>
+      <div class="row">
+        <div><label>Logo 最大歪斜(°)</label><input type="number" id="maxSkew" value="8"/></div>
+        <div><label>螺丝阈值(0-1)</label><input type="number" id="screwMin" step="0.05" value="0.55"/></div>
+      </div>
+      <div class="row">
+        <div><label>Logo 变化容差(%) 越大越宽松</label><input type="number" id="logoDiff" step="5" min="0" max="100" value="25"/></div>
+      </div>
+      <button onclick="autoScrews()">🔍 自动识别螺丝位</button>
+      <div class="hint" id="specStat">螺丝位: 0　Logo: 0</div>
+      <div class="hint">螺丝、Logo 都可只标其一 —— <b>没有的就不用标</b>。Logo 可框<b>多个</b>。</div>
+      <div class="row">
+        <button onclick="saveSpec()">保存检测配置</button>
+      </div>
+      <div class="row">
+        <button class="ghost" onclick="undoScrew()">撤销螺丝</button>
+        <button class="ghost" onclick="clearScrews()">清空螺丝</button>
+      </div>
+      <div class="row">
+        <button class="ghost" onclick="undoLogo()">撤销 Logo</button>
+        <button class="ghost" onclick="clearLogo()">清空 Logo</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>③ 触发工件检测</h2>
+      <button onclick="inspectPlate()">📷 相机采图检测</button>
+      <hr/>
+      <label>或上传待测图（离线调试）</label>
+      <input type="file" id="inspectFile" accept="image/*"/>
+      <button class="ghost" onclick="inspectPlateFile()">上传图片检测</button>
+    </div>
+  </div>
+
+  <!-- 右侧标准图 + 结果 -->
+  <div>
+    <div class="card">
+      <h2>🏭 流水线看板（传感器触发 · 自动检测）</h2>
+      <div class="metrics">
+        <div class="metric"><div class="k">传感器</div><div class="v" id="lSensor">—</div></div>
+        <div class="metric"><div class="k">已检总数</div><div class="v" id="lTotal">0</div></div>
+        <div class="metric"><div class="k">合格 OK</div><div class="v" id="lOk" style="color:var(--ok)">0</div></div>
+        <div class="metric"><div class="k">不良 NG</div><div class="v" id="lNg" style="color:var(--ng)">0</div></div>
+      </div>
+      <div class="row">
+        <button class="ghost" onclick="toggleLive()" id="btnLive">▶ 开始看板轮询</button>
+        <button class="ghost" onclick="resetLine()">清零统计</button>
+      </div>
+      <div class="hint">每检测一件生成一张卡片（缩略图+结果），最新在前。点缩略图看大图。</div>
+      <div class="gallery" id="lGallery"></div>
+    </div>
+
+    <div class="card">
+      <h2>标准图 · 示教（红点=螺丝位，蓝框=Logo）</h2>
+      <div class="canvas-box"><canvas id="tplCanvas" width="640" height="360"></canvas></div>
+      <div class="hint" id="tplHint">请选择或注册一个产品的标准图。</div>
+    </div>
+
+    <div class="card">
+      <h2>检测结果</h2>
+      <div class="result-banner idle" id="banner">等待检测…</div>
+      <div class="alarm" id="alarm">⚠ 已触发报警</div>
+      <div class="metrics" id="metrics" style="display:none">
+        <div class="metric"><div class="k">结论</div><div class="v" id="mRes">-</div></div>
+        <div class="metric"><div class="k">螺丝(缺/总)</div><div class="v" id="mScrew">-</div></div>
+        <div class="metric"><div class="k">Logo</div><div class="v" id="mLogo">-</div></div>
+        <div class="metric"><div class="k">耗时</div><div class="v" id="mMs">-</div></div>
+      </div>
+      <div class="defects" id="defects"></div>
+      <div class="images" id="imgs" style="display:none">
+        <figure><img id="imgAnnot" alt="标注图"/><figcaption>检测标注图（缺陷已圈选）</figcaption></figure>
+        <figure><img id="imgTpl" alt="标准图"/><figcaption>标准图</figcaption></figure>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = "/api/v1";
+let tplImage = new Image();
+let natW = 0, natH = 0, scale = 1;
+let mode = 'screw';                 // 'screw' | 'logo'
+let screws = [];                    // {id,x,y,r} 原始像素
+let logos = [];                     // [{x,y,width,height,...}] 支持多个 Logo
+let logoTemp = null;                // 拖拽中临时框
+let dragging = false, sx=0, sy=0, dragMoved=false;
+
+const canvas = document.getElementById('tplCanvas');
+const ctx = canvas.getContext('2d');
+
+function toast(m,t='info'){const e=document.getElementById('toast');e.textContent=m;e.className='toast show '+(t==='error'?'err':t==='ok'?'ok':'');setTimeout(()=>e.className='toast',2600);}
+function pc(){return document.getElementById('productCode').value.trim();}
+
+async function loadTemplates(){
+  try{const r=await fetch(`${API}/inspect/templates`);const list=await r.json();
+    document.getElementById('templateList').innerHTML='<option value="">—</option>'+list.map(c=>`<option>${c}</option>`).join('');
+  }catch(e){}
+}
+function onPickTemplate(){const v=document.getElementById('templateList').value;if(v){document.getElementById('productCode').value=v;showTemplate();loadSpec();}}
+
+async function registerTemplate(){
+  const code=pc(),f=document.getElementById('templateFile').files[0];
+  if(!code)return toast('请输入产品编码','error');
+  if(!f)return toast('请选择标准图','error');
+  const fd=new FormData();fd.append('image',f);
+  const r=await fetch(`${API}/inspect/template/${encodeURIComponent(code)}`,{method:'POST',body:fd});
+  if(r.ok){toast('标准图已保存','ok');screws=[];logos=[];await loadTemplates();showTemplate(true);}
+  else toast('保存失败','error');
+}
+
+function setMode(m){mode=m;
+  document.getElementById('btnScrew').className=m==='screw'?'on':'ghost';
+  document.getElementById('btnLogo').className=m==='logo'?'on':'ghost';
+}
+
+function showTemplate(bust){
+  const code=pc();if(!code)return;
+  const url=`${API}/image/template/${encodeURIComponent(code)}`+(bust?`?t=${Date.now()}`:'');
+  tplImage=new Image();
+  tplImage.onload=()=>{natW=tplImage.naturalWidth;natH=tplImage.naturalHeight;fit();draw();
+    document.getElementById('tplHint').textContent=`标准图 ${natW}×${natH}px。点击加螺丝位，拖拽框 Logo。`;};
+  tplImage.onerror=()=>{document.getElementById('tplHint').textContent='该产品尚未注册标准图。';ctx.clearRect(0,0,canvas.width,canvas.height);};
+  tplImage.src=url;
+}
+function fit(){scale=Math.min(1,640/natW);canvas.width=Math.round(natW*scale);canvas.height=Math.round(natH*scale);}
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(tplImage.complete&&natW)ctx.drawImage(tplImage,0,0,canvas.width,canvas.height);
+  // 螺丝位
+  ctx.lineWidth=2;
+  screws.forEach((s,i)=>{
+    ctx.strokeStyle='#e5484d';ctx.fillStyle='rgba(229,72,77,.25)';
+    ctx.beginPath();ctx.arc(s.x*scale,s.y*scale,Math.max(5,s.r*scale),0,7);ctx.fill();ctx.stroke();
+    ctx.fillStyle='#fff';ctx.font='12px sans-serif';ctx.fillText(s.id,s.x*scale+s.r*scale+2,s.y*scale-2);
+  });
+  // Logo 框（多个）
+  const drawBox=(b,label)=>{ctx.strokeStyle='#2f81f7';ctx.fillStyle='rgba(47,129,247,.15)';
+    ctx.fillRect(b.x*scale,b.y*scale,b.width*scale,b.height*scale);
+    ctx.strokeRect(b.x*scale,b.y*scale,b.width*scale,b.height*scale);
+    if(label){ctx.fillStyle='#fff';ctx.font='12px sans-serif';ctx.fillText(label,b.x*scale+2,b.y*scale-3);}};
+  logos.forEach((b,i)=>drawBox(b,'L'+(i+1)));
+  if(logoTemp)drawBox(logoTemp,'');
+  document.getElementById('specStat').textContent=`螺丝位: ${screws.length}　Logo: ${logos.length}`;
+}
+
+canvas.addEventListener('mousedown',e=>{if(!natW)return;const r=canvas.getBoundingClientRect();sx=e.clientX-r.left;sy=e.clientY-r.top;dragging=true;dragMoved=false;});
+canvas.addEventListener('mousemove',e=>{
+  if(!dragging)return;const r=canvas.getBoundingClientRect();const cx=e.clientX-r.left,cy=e.clientY-r.top;
+  if(Math.abs(cx-sx)>3||Math.abs(cy-sy)>3)dragMoved=true;
+  if(mode==='logo'&&dragMoved){
+    const x=Math.min(sx,cx),y=Math.min(sy,cy),w=Math.abs(cx-sx),h=Math.abs(cy-sy);
+    logoTemp={x:Math.round(x/scale),y:Math.round(y/scale),width:Math.round(w/scale),height:Math.round(h/scale)};
+    draw();
+  }
+});
+window.addEventListener('mouseup',e=>{
+  if(!dragging)return;dragging=false;
+  if(mode==='screw'&&!dragMoved){
+    const cx=sx,cy=sy; // click point
+    const rr=+document.getElementById('screwR').value||20;
+    screws.push({id:'S'+(screws.length+1),x:Math.round(cx/scale),y:Math.round(cy/scale),r:rr});
+    draw();
+  }
+  if(mode==='logo'&&dragMoved&&logoTemp&&logoTemp.width>4&&logoTemp.height>4){
+    logos.push({x:logoTemp.x,y:logoTemp.y,width:logoTemp.width,height:logoTemp.height,
+      maxSkewDeg:+document.getElementById('maxSkew').value||8,minGoodMatches:12,minScore:0.45});
+    logoTemp=null;draw();
+  }else{logoTemp=null;}
+});
+async function autoScrews(){
+  const code=pc();if(!code)return toast('请输入产品编码','error');
+  const rr=+document.getElementById('screwR').value||20;
+  const minR=Math.max(6,Math.round(rr*0.4)), maxR=Math.round(rr*2.5);
+  toast('识别中…');
+  try{
+    const r=await fetch(`${API}/inspect/template/${encodeURIComponent(code)}/spec/auto?minR=${minR}&maxR=${maxR}`,{method:'POST'});
+    const s=await r.json();if(!r.ok)throw new Error(s.message||'识别失败');
+    screws=s.screws||[];draw();
+    toast('自动识别到 '+screws.length+' 个螺丝位，请核对后保存',screws.length?'ok':'error');
+  }catch(e){toast(e.message,'error');}
+}
+function undoScrew(){screws.pop();draw();}
+function clearScrews(){screws=[];draw();}
+function undoLogo(){logos.pop();draw();}
+function clearLogo(){logos=[];draw();}
+
+async function saveSpec(){
+  const code=pc();if(!code)return toast('请输入产品编码','error');
+  // 螺丝、Logo 都可为空——没标的就不检测；但至少要标一样，否则检测无意义
+  if(screws.length===0&&logos.length===0)
+    return toast('请至少示教一个螺丝位或 Logo（没有的可以不标）','error');
+  const sk=+document.getElementById('maxSkew').value||8;
+  const df=(+document.getElementById('logoDiff').value||25)/100;   // 百分比 -> 比例
+  logos.forEach(b=>{b.maxSkewDeg=sk;b.minGoodMatches=b.minGoodMatches||12;b.minScore=b.minScore||0.45;b.maxDiffRatio=df;});
+  const spec={screws,logos,screwMinScore:+document.getElementById('screwMin').value||0.55};
+  const r=await fetch(`${API}/inspect/template/${encodeURIComponent(code)}/spec`,{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(spec)});
+  if(r.ok)toast(`已保存：${screws.length}螺丝 + ${logos.length}Logo`,'ok');else toast('保存失败','error');
+}
+async function loadSpec(){
+  const code=pc();if(!code)return;
+  try{const r=await fetch(`${API}/inspect/template/${encodeURIComponent(code)}/spec`);const s=await r.json();
+    screws=s.screws||[];logos=s.logos||[];
+    if(s.screwMinScore)document.getElementById('screwMin').value=s.screwMinScore;
+    if(logos[0]&&logos[0].maxSkewDeg)document.getElementById('maxSkew').value=logos[0].maxSkewDeg;
+    if(logos[0]&&logos[0].maxDiffRatio!=null)document.getElementById('logoDiff').value=Math.round(logos[0].maxDiffRatio*100);
+    draw();
+  }catch(e){}
+}
+
+async function inspectPlate(){
+  const code=pc();if(!code)return toast('请输入产品编码','error');
+  banner('检测中…','idle');
+  try{const r=await fetch(`${API}/inspect/${encodeURIComponent(code)}/plate`,{method:'POST'});
+    const d=await r.json();if(!r.ok)throw new Error(d.message||'检测失败');render(d);
+  }catch(e){banner('检测失败','ng');toast(e.message,'error');}
+}
+async function inspectPlateFile(){
+  const code=pc(),f=document.getElementById('inspectFile').files[0];
+  if(!code)return toast('请输入产品编码','error');
+  if(!f)return toast('请选择待测图','error');
+  banner('检测中…','idle');const fd=new FormData();fd.append('image',f);
+  try{const r=await fetch(`${API}/inspect/${encodeURIComponent(code)}/plate/file`,{method:'POST',body:fd});
+    const d=await r.json();if(!r.ok)throw new Error(d.message||'检测失败');render(d);
+  }catch(e){banner('检测失败','ng');toast(e.message,'error');}
+}
+
+function banner(t,c){const b=document.getElementById('banner');b.textContent=t;b.className='result-banner '+c;}
+function relCap(p){return p?encodeURIComponent(p.replace(/\\/g,'/').replace(/^\.?\/?data\/captures\//,'')):'';}
+function render(d){
+  banner(d.passed?'OK':'NG',d.passed?'ok':'ng');
+  document.getElementById('alarm').style.display=d.alarmTriggered?'block':'none';
+  document.getElementById('metrics').style.display='grid';
+  document.getElementById('mRes').textContent=d.passed?'合格':'不合格';
+  document.getElementById('mScrew').textContent=(d.screwMissing??0)+' / '+(d.screwExpected??0);
+  document.getElementById('mLogo').textContent=d.logoPassed==null?'—':(d.logoPassed?('正常 '+(d.logoSkewDeg??0)+'°'):('异常 '+(d.logoSkewDeg??0)+'°'));
+  document.getElementById('mMs').textContent=d.elapsedMs+' ms';
+  // 缺陷列表
+  const dv=document.getElementById('defects');
+  dv.innerHTML=(d.defects&&d.defects.length)?d.defects.map((x,i)=>
+    `<div class="d"><span class="idx">${i+1}</span><span>${x.message}</span></div>`).join(''):'';
+  // 图片
+  document.getElementById('imgs').style.display='grid';
+  const base='/api/v1/image/capture?path=';
+  document.getElementById('imgAnnot').src=d.annotatedImagePath?base+relCap(d.annotatedImagePath):'';
+  document.getElementById('imgTpl').src=`/api/v1/image/template/${encodeURIComponent(d.productCode)}?t=${Date.now()}`;
+  toast(d.passed?'检测通过 OK':'检出缺陷，已报警 NG',d.passed?'ok':'error');
+}
+
+// ===== 流水线看板轮询 =====
+let liveTimer=null, lastSeq=-1;
+function toggleLive(){
+  const b=document.getElementById('btnLive');
+  if(liveTimer){clearInterval(liveTimer);liveTimer=null;b.textContent='▶ 开始看板轮询';b.className='ghost';}
+  else{liveTimer=setInterval(pollLine,1000);b.textContent='⏸ 停止轮询';b.className='on';pollLine();}
+}
+async function pollLine(){
+  try{
+    const r=await fetch(`${API}/inspect/line/results`);const s=await r.json();
+    document.getElementById('lTotal').textContent=s.total;
+    document.getElementById('lOk').textContent=s.ok;
+    document.getElementById('lNg').textContent=s.ng;
+    // 传感器状态从 Python /status 取（同机 5000 端口，可选）
+    document.getElementById('lSensor').textContent=(s.ng>0||s.ok>0)?'运行中':'待料';
+    const list=s.recent||[];
+    const base='/api/v1/image/capture?path=';
+    // 每件一张卡片：编号取"总数-index"，最新在最前
+    document.getElementById('lGallery').innerHTML=list.map((d,i)=>{
+      const cls=d.passed?'ok':'ng';
+      const tag=d.passed?'OK':'NG';
+      const no=s.total-i;                       // 该件的检测序号
+      const img=d.annotatedImagePath?base+relCap(d.annotatedImagePath):'';
+      const screw=(d.screwMissing!=null)?`螺丝 ${d.screwMissing}/${d.screwExpected}`:'';
+      return `<div class="gcard ${cls}">
+        <span class="tag ${cls}">${tag}</span><span class="seq">#${no}</span>
+        ${img?`<img src="${img}" onclick="window.open('${img}','_blank')" title="点击看大图"/>`:'<div style="height:120px"></div>'}
+        <div class="meta"><b>${d.productCode}</b><br>${screw}<br>${d.elapsedMs||''}ms</div>
+      </div>`;
+    }).join('');
+    if(list.length && s.seq!==lastSeq){
+      lastSeq=s.seq;const d=list[0];
+      if(!d.passed) toast('流水线检出不良并报警：'+(d.message||''),'error');
+    }
+  }catch(e){}
+}
+async function resetLine(){await fetch(`${API}/inspect/line/reset`,{method:'POST'});lastSeq=-1;pollLine();}
+
+document.getElementById('camBadge').textContent='相机: 见 application.yml';
+loadTemplates();showTemplate();loadSpec();
+</script>
+</body>
+</html>
