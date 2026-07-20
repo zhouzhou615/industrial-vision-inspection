@@ -23,5 +23,5 @@ public class LogoSpec {
     private double minScore = 0.45;
     /** “最大单块连续变化”占区域比例的阈值，超过判为 Logo 被改动/遮挡。
      *  用最大连通块而非总占比：光照/错位的零散噪点被滤除，故阈值可较小。默认 0.03(3%)。 */
-    private double maxDiffRatio = 0.03;
+    private double maxDiffRatio = 0.02;
 }

@@ -12,9 +12,13 @@ import org.opencv.core.MatOfKeyPoint;
 import org.opencv.core.MatOfPoint2f;
 import org.opencv.core.Point;
 import org.opencv.core.Rect;
+import org.opencv.core.CvType;
+import org.opencv.core.Size;
+import org.opencv.core.TermCriteria;
 import org.opencv.features2d.DescriptorMatcher;
 import org.opencv.features2d.ORB;
 import org.opencv.imgproc.Imgproc;
+import org.opencv.video.Video;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -31,6 +35,7 @@ public final class LogoInspector {
         public double skewDeg = 0.0;
         public double score = 1.0;
         public double diffRatio = 0.0;
+        public int blobPixels = 0;
         public Defect defect;
     }
 
@@ -56,30 +61,47 @@ public final class LogoInspector {
         Mat tLogoEdge = EdgeUtil.gradient(tLogo);
         Mat cSearchEdge = EdgeUtil.gradient(cSearch);
         try {
-            // 1. 定位并取匹配得分（用边缘匹配，抗光照；同时记住最佳位置以做局部差异）
+            // 1. 平移定位（边缘匹配，抗光照），得到最佳位置
             org.opencv.core.Point loc = new org.opencv.core.Point(0, 0);
-            double edgeScore = 0.0;
             if (cSearchEdge.cols() >= tLogoEdge.cols() && cSearchEdge.rows() >= tLogoEdge.rows()) {
                 Mat r = new Mat();
                 Imgproc.matchTemplate(cSearchEdge, tLogoEdge, r, Imgproc.TM_CCOEFF_NORMED);
-                Core.MinMaxLocResult mm = Core.minMaxLoc(r);
-                edgeScore = mm.maxVal;
-                loc = mm.maxLoc;
+                loc = Core.minMaxLoc(r).maxLoc;
                 r.release();
             }
-            double grayScore = EdgeUtil.matchScore(cSearch, tLogo);
-            double score = Math.max(grayScore, edgeScore);
-            res.score = round2(score);
 
-            // 2. 局部差异检测（关键改进）：把标准 Logo 与采图最佳匹配处对齐后逐像素比对，
-            //    统计“明显变化像素占比”。整体相关性高、但局部被遮挡/改字时，这里能抓出来。
-            double diffRatio = localDiffRatio(tLogo, tLogoEdge, cSearch, cSearchEdge, loc);
+            // 2. 取最佳位置等大子图 → 局部 ECC 精配准（旋转+错切+缩放也对齐）
+            //    之后“匹配得分”和“变化占比”都在精配准图上算：正确但倾斜的 Logo 分数回到高位，
+            //    真正换错/遮挡的内容 ECC 对不上，分数低、变化大。
+            int w = tLogo.cols();
+            int h = tLogo.rows();
+            double score = 0.0;
+            double diffRatio = 0.0;
+            if (cSearch.cols() >= w && cSearch.rows() >= h) {
+                int mx = (int) Math.max(0, Math.min(loc.x, cSearch.cols() - w));
+                int my = (int) Math.max(0, Math.min(loc.y, cSearch.rows() - h));
+                Mat cLogo = cSearch.submat(my, my + h, mx, mx + w).clone();
+                Mat reg = registerEcc(tLogo, cLogo);
+                Mat regEdge = EdgeUtil.gradient(reg);
+                double g = EdgeUtil.matchScore(reg, tLogo);
+                double e = EdgeUtil.matchScore(regEdge, tLogoEdge);
+                score = Math.max(g, e);
+                diffRatio = changedRatio(tLogo, reg, 55);
+                regEdge.release();
+                reg.release();
+                cLogo.release();
+            }
+            res.score = round2(score);
             res.diffRatio = round2(diffRatio);
 
             // 3. 旋转角（辅助歪斜判定）
             double skew = estimateSkew(tLogo, new Mat(alignedGray, rect), logo);
             res.skewDeg = round1(skew);
 
+            res.blobPixels = (int) Math.round(diffRatio * (double) rect.width * rect.height);
+
+            // 只用百分比判据：手持/透视下正常残差的“最大变化块”占比稳定为 0%，
+            // 真实改动为数个百分点，二者分得很开；绝对像素会被透视噪声干扰，弃用。
             boolean wrong = score < logo.getMinScore();
             boolean altered = diffRatio > logo.getMaxDiffRatio();
             boolean skewed = !Double.isNaN(skew) && Math.abs(skew) > logo.getMaxSkewDeg();
@@ -89,7 +111,7 @@ public final class LogoInspector {
                         score, logo.getMinScore()), "LOGO_WRONG");
             } else if (altered) {
                 res.passed = false;
-                res.defect = logoDefect(rect, String.format("Logo 被改动/遮挡 (差异 %.0f%% > %.0f%%)",
+                res.defect = logoDefect(rect, String.format("Logo 被改动/遮挡 (变化 %.1f%% > %.1f%%)",
                         diffRatio * 100, logo.getMaxDiffRatio() * 100), "LOGO_CHANGED");
             } else if (skewed) {
                 res.passed = false;
@@ -118,11 +140,35 @@ public final class LogoInspector {
         if (cSearch.cols() < w || cSearch.rows() < h) {
             return 0.0;
         }
-        Mat cLogo = cSearch.submat(my, my + h, mx, mx + w);
-        // 只用灰度通道：边缘逐像素差对亚像素错位过于敏感，易误报，弃用。
-        double grayRatio = changedRatio(tLogo, cLogo, 55);
+        Mat cLogo = cSearch.submat(my, my + h, mx, mx + w).clone();
+        // ★关键加强：局部 ECC 精配准，把采图 Logo 在“旋转+错切+缩放”上也精确套到标准 Logo，
+        //   消除透视/手持带来的残余错位，再比对——正常件残差趋近 0，真实改动才会凸显。
+        Mat registered = registerEcc(tLogo, cLogo);
+        double grayRatio = changedRatio(tLogo, registered, 55);
+        registered.release();
         cLogo.release();
         return grayRatio;
+    }
+
+    /**
+     * 局部仿射 ECC 精配准：返回把 cLogo 校正到 tLogo 几何后的图；失败则返回原图副本。
+     * ECC 只对齐几何（旋转/错切/缩放/平移），不会掩盖内容改动——改字/遮挡仍留作差异。
+     */
+    private static Mat registerEcc(Mat tLogo, Mat cLogo) {
+        try {
+            Mat warp = Mat.eye(2, 3, CvType.CV_32F);
+            TermCriteria crit = new TermCriteria(TermCriteria.COUNT + TermCriteria.EPS, 50, 1e-4);
+            // 高斯平滑输入有助 ECC 收敛（gaussFiltSize=5）
+            Video.findTransformECC(tLogo, cLogo, warp, Video.MOTION_AFFINE, crit, new Mat(), 5);
+            Mat out = new Mat();
+            Imgproc.warpAffine(cLogo, out, warp, tLogo.size(),
+                    Imgproc.INTER_LINEAR + Imgproc.WARP_INVERSE_MAP);
+            warp.release();
+            return out;
+        } catch (Exception e) {
+            // ECC 不收敛会抛异常 → 退回未精配准的原图
+            return cLogo.clone();
+        }
     }
 
     /**

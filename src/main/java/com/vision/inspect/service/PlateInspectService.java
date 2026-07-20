@@ -134,6 +134,9 @@ public class PlateInspectService {
                 int idx = 1;
                 for (com.vision.inspect.model.LogoSpec lg : spec.getLogos()) {
                     LogoInspector.LogoResult lr = LogoInspector.inspect(templateGray, alignedGray, lg);
+                    log.info("  Logo{} 匹配得分={} 最大变化块={}%/{}像素 (阈值 得分<{} 或 变化>{}% 或 >40像素)",
+                            idx, lr.score, Math.round(lr.diffRatio * 100), lr.blobPixels,
+                            lg.getMinScore(), Math.round(lg.getMaxDiffRatio() * 100));
                     if (Math.abs(lr.skewDeg) > Math.abs(worstSkew)) {
                         worstSkew = lr.skewDeg;
                     }
@@ -151,8 +154,8 @@ public class PlateInspectService {
 
             boolean passed = defects.isEmpty();
 
-            // 3. 标注缺陷图
-            annotated = DefectAnnotator.annotate(aligned, defects);
+            // 3. 标注缺陷图（同时画出被检测的区域，便于确认改动是否落在检测区）
+            annotated = DefectAnnotator.annotate(aligned, defects, spec);
             Path capturePath = saveImage(productCode, "capture", captured);
             Path annotatedPath = saveImage(productCode, "annotated", annotated);
 

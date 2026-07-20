@@ -105,7 +105,7 @@
         <div><label>螺丝阈值(0-1)</label><input type="number" id="screwMin" step="0.05" value="0.55"/></div>
       </div>
       <div class="row">
-        <div><label>Logo 变化容差(%) 越大越宽松</label><input type="number" id="logoDiff" step="5" min="0" max="100" value="25"/></div>
+        <div><label>Logo 变化容差(%) 越小越敏感</label><input type="number" id="logoDiff" step="1" min="0" max="100" value="2"/></div>
       </div>
       <button onclick="autoScrews()">🔍 自动识别螺丝位</button>
       <div class="hint" id="specStat">螺丝位: 0　Logo: 0</div>
@@ -293,7 +293,7 @@ async function saveSpec(){
   if(screws.length===0&&logos.length===0)
     return toast('请至少示教一个螺丝位或 Logo（没有的可以不标）','error');
   const sk=+document.getElementById('maxSkew').value||8;
-  const df=(+document.getElementById('logoDiff').value||25)/100;   // 百分比 -> 比例
+  const df=(+document.getElementById('logoDiff').value||2)/100;   // 百分比 -> 比例（最大连续变化块占比）
   logos.forEach(b=>{b.maxSkewDeg=sk;b.minGoodMatches=b.minGoodMatches||12;b.minScore=b.minScore||0.45;b.maxDiffRatio=df;});
   const spec={screws,logos,screwMinScore:+document.getElementById('screwMin').value||0.55};
   const r=await fetch(`${API}/inspect/template/${encodeURIComponent(code)}/spec`,{
