@@ -128,29 +128,6 @@ public final class LogoInspector {
     }
 
     /**
-     * 局部差异占比：在采图搜索窗内取最佳匹配处的等大子图，与标准 Logo 逐像素比对，
-     * 用灰度差与边缘差各算一份变化像素占比，取较大者（任一通道有明显变化都算改动）。
-     */
-    private static double localDiffRatio(Mat tLogo, Mat tLogoEdge, Mat cSearch, Mat cSearchEdge,
-                                         org.opencv.core.Point loc) {
-        int w = tLogo.cols();
-        int h = tLogo.rows();
-        int mx = (int) Math.max(0, Math.min(loc.x, cSearch.cols() - w));
-        int my = (int) Math.max(0, Math.min(loc.y, cSearch.rows() - h));
-        if (cSearch.cols() < w || cSearch.rows() < h) {
-            return 0.0;
-        }
-        Mat cLogo = cSearch.submat(my, my + h, mx, mx + w).clone();
-        // ★关键加强：局部 ECC 精配准，把采图 Logo 在“旋转+错切+缩放”上也精确套到标准 Logo，
-        //   消除透视/手持带来的残余错位，再比对——正常件残差趋近 0，真实改动才会凸显。
-        Mat registered = registerEcc(tLogo, cLogo);
-        double grayRatio = changedRatio(tLogo, registered, 55);
-        registered.release();
-        cLogo.release();
-        return grayRatio;
-    }
-
-    /**
      * 局部仿射 ECC 精配准：返回把 cLogo 校正到 tLogo 几何后的图；失败则返回原图副本。
      * ECC 只对齐几何（旋转/错切/缩放/平移），不会掩盖内容改动——改字/遮挡仍留作差异。
      */

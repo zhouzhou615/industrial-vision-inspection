@@ -5,6 +5,8 @@ import com.vision.inspect.model.InspectionSpec;
 import com.vision.inspect.model.ScrewPoint;
 import org.opencv.core.Mat;
 import org.opencv.core.Rect;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -21,6 +23,8 @@ import java.util.List;
  */
 public final class ScrewDetector {
 
+    private static final Logger log = LoggerFactory.getLogger(ScrewDetector.class);
+
     private ScrewDetector() {
     }
 
@@ -36,7 +40,8 @@ public final class ScrewDetector {
             for (ScrewPoint sp : spec.getScrews()) {
                 int r = Math.max(4, sp.getR());
                 Rect patchRect = clamp(sp.getX() - r, sp.getY() - r, 2 * r, 2 * r, cols, rows);
-                int margin = Math.max(12, r);
+                // 搜索窗中等余量：够吸收局部对齐偏差(修正“有螺丝却低分”)，又不至于够到旁边的孔
+                int margin = Math.max(8, (int) (r * 0.6));
                 Rect searchRect = clamp(sp.getX() - r - margin, sp.getY() - r - margin,
                         2 * r + 2 * margin, 2 * r + 2 * margin, cols, rows);
 
@@ -49,6 +54,10 @@ public final class ScrewDetector {
                 }
                 // 取两路最优：边缘匹配抗光照，灰度匹配补充
                 double score = Math.max(edgeScore, grayScore);
+
+                log.info("  螺丝 {} 边缘={} 灰度={} 取={} (阈值<{}={}判漏打)",
+                        sp.getId(), fmt(edgeScore), fmt(grayScore), fmt(score),
+                        spec.getScrewMinScore(), score < spec.getScrewMinScore() ? "是" : "否");
 
                 if (score < spec.getScrewMinScore()) {
                     defects.add(Defect.builder()
@@ -79,6 +88,10 @@ public final class ScrewDetector {
             patch.release();
             search.release();
         }
+    }
+
+    private static String fmt(double v) {
+        return String.format("%.2f", v);
     }
 
     private static Rect clamp(int x, int y, int w, int h, int cols, int rows) {

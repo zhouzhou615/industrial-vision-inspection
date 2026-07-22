@@ -1,5 +1,5 @@
 server:
-  port: 8088
+  port: 8080
 
 spring:
   servlet:
@@ -35,7 +35,6 @@ vision:
   vm:
     enabled: true
     tcp-port: 9000
-    # VM 输出的标注图目录（用于拷进采图目录供网页展示，可空）
     image-dir: ""
 
 logging:
