@@ -68,6 +68,7 @@ CFG = None
 
 # 运行时共享状态
 state_lock = threading.Lock()
+post_busy = threading.Lock()  # 保证同一时刻只有一个 Java 检测请求，避免堆积超时
 latest_jpeg = None            # 最新一帧（供 /grab）
 sensor_active = False         # 当前传感器是否有料
 stats = {"items": 0, "sent": 0, "last": None}
@@ -131,6 +132,7 @@ def open_camera(cfg):
         except Exception as e:
             print("警告: 配置补光频闪失败(%s)，请在 MVS 的 属性→数字IO 里手动确认 %s 设为 Strobe 并开启 StrobeEnable"
                   % (e, cfg.strobe_line))
+    # 三色灯改由 USB/串口继电器模块(Modbus RTU)控制，见 relay_open()/set_tricolor()，此处不再用相机 IO
 
     # 最后选择传感器输入线，保证运行期读取的 LineStatus 是传感器那条线
     try:
@@ -140,6 +142,93 @@ def open_camera(cfg):
 
     check(cam.MV_CC_StartGrabbing(), "开始取流")
     print("相机已就绪（连续采集），传感器线: %s，工件产品号: %s" % (cfg.line, cfg.product))
+
+
+# ==== 三色灯：中盛 ZS-8I0-R-10A 八路继电器模块（Modbus RTU / RS232/485）====
+relay_ser = None
+
+
+def _crc16(data):
+    """Modbus RTU CRC16。"""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
+
+
+def relay_open():
+    """打开继电器串口。失败则三色灯不可用（不影响检测）。"""
+    global relay_ser
+    if not CFG or not CFG.light:
+        return
+    try:
+        import serial  # pip install pyserial
+        relay_ser = serial.Serial(CFG.relay_port, CFG.relay_baud, timeout=0.3)
+        print("继电器串口已打开: %s @ %d (绿=out1 黄=out2 红=out3 蜂鸣=out4)"
+              % (CFG.relay_port, CFG.relay_baud))
+    except Exception as e:
+        relay_ser = None
+        print("警告: 打开继电器串口失败(%s)。三色灯不可用；如缺库请 pip install pyserial" % e)
+
+
+# 厂家原始指令帧（功能码06写寄存器）：绿=out1 黄=out2 红=out3 蜂鸣=out4
+RELAY_CMDS = {
+    "green_on":   "01 06 00 00 00 01 48 0A",
+    "green_off":  "01 06 00 00 00 00 89 CA",
+    "yellow_on":  "01 06 00 01 00 01 19 CA",
+    "yellow_off": "01 06 00 01 00 00 D8 0A",
+    "red_on":     "01 06 00 02 00 01 E9 CA",
+    "red_off":    "01 06 00 02 00 00 28 0A",
+    "beep_on":    "01 06 00 04 00 01 09 CB",
+    "beep_off":   "01 06 00 04 00 00 C8 0B",
+    "all_off":    "01 06 00 34 00 00 C8 04",
+}
+
+
+def relay_send(key):
+    """按名称发送厂家指令帧。"""
+    if relay_ser is None:
+        return
+    try:
+        relay_ser.write(bytes.fromhex(RELAY_CMDS[key].replace(" ", "")))
+        relay_ser.read(8)  # 读掉应答，避免堆积
+    except Exception as e:
+        print("继电器写入失败(%s): %s" % (key, e))
+
+
+def set_tricolor(passed):
+    """None→运行中(黄)；True→OK(绿)；False→NG(红+蜂鸣)。互斥点亮。"""
+    if not CFG or not CFG.light or relay_ser is None:
+        return
+    if passed is True:                 # OK：绿
+        relay_send("yellow_off"); relay_send("red_off"); relay_send("beep_off")
+        relay_send("green_on")
+    elif passed is False:              # NG：红 + 蜂鸣
+        relay_send("yellow_off"); relay_send("green_off")
+        relay_send("red_on")
+        if CFG.beep:
+            relay_send("beep_on")
+    else:                             # 运行中/待料：黄
+        relay_send("green_off"); relay_send("red_off"); relay_send("beep_off")
+        relay_send("yellow_on")
+
+
+def light_selftest():
+    """开机自检：黄→绿→红各亮1秒，最后回到黄(运行中)。确认继电器/接线是否生效。"""
+    if not CFG or not CFG.light or relay_ser is None:
+        return
+    print("三色灯自检: 黄→绿→红…")
+    relay_send("all_off")
+    set_tricolor(None); time.sleep(1.0)   # 黄
+    set_tricolor(True); time.sleep(1.0)   # 绿
+    set_tricolor(False); time.sleep(1.0)  # 红(+蜂鸣)
+    set_tricolor(None)                    # 回到黄=运行中
+    print("三色灯自检结束（没看到灯亮 → 检查 COM口/波特率/接线）")
 
 
 def read_line_status():
@@ -183,9 +272,10 @@ def post_frame_to_java(jpg_bytes, frame_count):
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "multipart/form-data; boundary=" + boundary)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         passed = data.get("passed")
+        set_tricolor(passed)   # OK→绿灯，NG→红灯
         with state_lock:
             stats["sent"] += 1
             stats["last"] = {"passed": passed, "message": data.get("message"),
@@ -196,6 +286,14 @@ def post_frame_to_java(jpg_bytes, frame_count):
               (stats["items"], "OK" if passed else "NG", data.get("message"), frame_count))
     except Exception as e:
         print("上传 Java 检测失败: %s" % e)
+
+
+def _post_and_release(jpg_bytes, frame_count):
+    """发送后释放 post_busy 锁，保证串行。"""
+    try:
+        post_frame_to_java(jpg_bytes, frame_count)
+    finally:
+        post_busy.release()
 
 
 def capture_loop():
@@ -246,6 +344,7 @@ def capture_loop():
                     frame_count = 0
                     with state_lock:
                         stats["items"] += 1
+                    set_tricolor(None)  # 工件进入→黄灯(运行中)，结果出来再变绿/红
                     print("[件#%d] 工件进入检测区，开始采集…" % stats["items"])
             else:
                 # 工件在检测区内：有料就累计最清晰帧（短暂掉料不结束）
@@ -264,10 +363,17 @@ def capture_loop():
                         if okj:
                             jpg = encj.tobytes()
                             fc = frame_count
-                            threading.Thread(target=post_frame_to_java,
-                                             args=(jpg, fc), daemon=True).start()
+                            # 同一时刻只发一个检测请求：Java 还在忙就跳过本件，避免堆积超时
+                            if post_busy.acquire(blocking=False):
+                                threading.Thread(target=_post_and_release,
+                                                 args=(jpg, fc), daemon=True).start()
+                            else:
+                                print("[件#%d] Java 检测繁忙，跳过本件" % stats["items"])
                     elif frame_count > 0:
                         print("[件#%d] 采集帧数不足(%d)，丢弃" % (stats["items"], frame_count))
+        except Exception as e:
+            # 单帧异常不许搞垮整个采图线程（7×24 稳定性）
+            print("采图处理异常(已忽略本帧): %s" % e)
         finally:
             cam.MV_CC_FreeImageBuffer(st_frame)
 
@@ -333,10 +439,16 @@ def main():
     ap.add_argument("--min-frames", type=int, default=3, help="一件至少采集多少帧才判定")
     ap.add_argument("--enter-confirm", type=int, default=3, help="连续多少帧有料才确认工件进入(防抖，去信号毛刺)")
     ap.add_argument("--leave-confirm", type=int, default=4, help="连续多少帧无料才确认工件离开(防抖)")
+    ap.add_argument("--light", type=int, default=1, help="1=启用三色灯(继电器)，0=不控制")
+    ap.add_argument("--relay-port", type=str, default="COM7", help="继电器模块串口，如 COM7")
+    ap.add_argument("--relay-baud", type=int, default=9600, help="继电器波特率(常见9600/115200)")
+    ap.add_argument("--beep", type=int, default=1, help="NG 时是否鸣蜂鸣器(out4)，1=响 0=不响")
     CFG = ap.parse_args()
     CFG.active_high = bool(CFG.active_high)
 
     open_camera(CFG)
+    relay_open()       # 打开继电器串口（三色灯）
+    light_selftest()   # 开机自检：绿灯→红灯各亮1秒，确认灯控制是否生效
     threading.Thread(target=capture_loop, daemon=True).start()
     try:
         server = ThreadingHTTPServer(("127.0.0.1", CFG.port), Handler)
