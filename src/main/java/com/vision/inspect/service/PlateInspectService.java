@@ -42,7 +42,7 @@ public class PlateInspectService {
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS");
 
     /** 检测工作分辨率上限：大图(如 5120×5120)降到此宽度再检测，速度快约 10 倍，坐标按比例缩放，结果等价。 */
-    private static final int WORK_MAX_WIDTH = 3100;
+    private static final int WORK_MAX_WIDTH = 5120;
 
     private final CameraFactory cameraFactory;
     private final TemplateManager templateManager;

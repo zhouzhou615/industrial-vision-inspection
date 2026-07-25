@@ -3,8 +3,11 @@ package com.vision.inspect.detect;
 import com.vision.inspect.model.Defect;
 import com.vision.inspect.model.InspectionSpec;
 import com.vision.inspect.model.ScrewPoint;
+import org.opencv.core.Core;
 import org.opencv.core.Mat;
+import org.opencv.core.Point;
 import org.opencv.core.Rect;
+import org.opencv.imgproc.Imgproc;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -12,14 +15,17 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 螺丝漏打检测（参考海康 VisionMaster 的做法：基于边缘/梯度的匹配，对光照更鲁棒）。
+ * 螺丝漏打检测（两段式，抓住"有无螺丝"的本质差异）：
  *
- * <p>每个螺丝位在采图对应处做两路归一化匹配并取最优：</p>
  * <ol>
- *   <li><b>梯度匹配</b>：先用 Sobel 求梯度幅值再匹配 —— 只看形状/边缘，不受整体明暗影响（主判据）；</li>
- *   <li><b>灰度匹配</b>：原始灰度 NCC，作为补充。</li>
+ *   <li><b>先定位</b>：用整个螺丝框（含周围板面，特征多）在小搜索窗内做梯度匹配，
+ *       精确找到螺丝<b>应该在的位置</b>，补偿残余对齐误差。</li>
+ *   <li><b>再判有无</b>：在定位好的点上，<b>只比对中心那一小块螺丝头</b>（灰度/边缘取优）。
+ *       装了螺丝→中心匹配得分高；漏打→中心是空洞/背景，得分骤降。</li>
  * </ol>
- * 综合得分低于阈值判为漏打。搜索窗放大以容忍残余对齐误差（相当于逐位局部再定位）。
+ *
+ * <p>关键：判定只看中心小块，不看周围板面 —— 这样"装没装螺丝"才有明显区分，
+ * 不会被大片相同的周围背景稀释掉。</p>
  */
 public final class ScrewDetector {
 
@@ -33,41 +39,59 @@ public final class ScrewDetector {
         int cols = templateGray.cols();
         int rows = templateGray.rows();
 
-        // 预计算整幅梯度幅值图（边缘特征，光照不变）
         Mat tGrad = EdgeUtil.gradient(templateGray);
         Mat cGrad = EdgeUtil.gradient(alignedGray);
         try {
             for (ScrewPoint sp : spec.getScrews()) {
                 int r = Math.max(4, sp.getR());
+
+                // ==== 第1段：用整框定位螺丝的真实位置（补偿残余对齐误差）====
                 Rect patchRect = clamp(sp.getX() - r, sp.getY() - r, 2 * r, 2 * r, cols, rows);
-                // 搜索窗中等余量：够吸收局部对齐偏差(修正“有螺丝却低分”)，又不至于够到旁边的孔
-                int margin = Math.max(8, (int) (r * 0.6));
+                int margin = Math.max(6, (int) (r * 0.6));
                 Rect searchRect = clamp(sp.getX() - r - margin, sp.getY() - r - margin,
                         2 * r + 2 * margin, 2 * r + 2 * margin, cols, rows);
 
-                double edgeScore = 0.0;
-                double grayScore = 0.0;
+                int locCx = sp.getX();  // 定位到的螺丝中心（采图坐标），默认=标称位置
+                int locCy = sp.getY();
                 if (patchRect.width > 3 && patchRect.height > 3
                         && searchRect.width > patchRect.width && searchRect.height > patchRect.height) {
-                    edgeScore = matchScore(cGrad, tGrad, searchRect, patchRect);
-                    grayScore = matchScore(alignedGray, templateGray, searchRect, patchRect);
+                    Mat patch = new Mat(tGrad, patchRect);
+                    Mat search = new Mat(cGrad, searchRect);
+                    Mat result = new Mat();
+                    Imgproc.matchTemplate(search, patch, result, Imgproc.TM_CCOEFF_NORMED);
+                    Point loc = Core.minMaxLoc(result).maxLoc;
+                    // 匹配到的框左上角 → 中心
+                    locCx = (int) (searchRect.x + loc.x + patchRect.width / 2.0);
+                    locCy = (int) (searchRect.y + loc.y + patchRect.height / 2.0);
+                    patch.release();
+                    search.release();
+                    result.release();
                 }
-                // 取两路最优：边缘匹配抗光照，灰度匹配补充
-                double score = Math.max(edgeScore, grayScore);
 
-                log.info("  螺丝 {} 边缘={} 灰度={} 取={} (阈值<{}={}判漏打)",
-                        sp.getId(), fmt(edgeScore), fmt(grayScore), fmt(score),
-                        spec.getScrewMinScore(), score < spec.getScrewMinScore() ? "是" : "否");
+                // ==== 第2段：只看中心小块，判断螺丝在不在 ====
+                int cr = Math.max(3, (int) (r * 0.4));    // 中心=螺丝头（越小越聚焦螺丝本身）
+                int cpad = 4;                              // 微小容差，吸收亚像素偏差
+                Rect tCenter = clamp(sp.getX() - cr, sp.getY() - cr, 2 * cr, 2 * cr, cols, rows);
+                Rect cCenter = clamp(locCx - cr - cpad, locCy - cr - cpad,
+                        2 * cr + 2 * cpad, 2 * cr + 2 * cpad, cols, rows);
 
-                if (score < spec.getScrewMinScore()) {
+                double centerGray = crop2Match(alignedGray, cCenter, templateGray, tCenter);
+                double centerEdge = crop2Match(cGrad, cCenter, tGrad, tCenter);
+                double presence = Math.max(centerGray, centerEdge);
+
+                log.info("  螺丝 {} 中心边缘={} 中心灰度={} 取={} (阈值<{}={}判漏打)",
+                        sp.getId(), fmt(centerEdge), fmt(centerGray), fmt(presence),
+                        spec.getScrewMinScore(), presence < spec.getScrewMinScore() ? "是" : "否");
+
+                if (presence < spec.getScrewMinScore()) {
                     defects.add(Defect.builder()
                             .type("SCREW_MISSING")
                             .shape("CIRCLE")
                             .x(sp.getX())
                             .y(sp.getY())
                             .r(r + 4)
-                            .message(String.format("螺丝 %s 漏打/异常 (边缘%.2f 灰度%.2f)",
-                                    sp.getId() == null ? "?" : sp.getId(), edgeScore, grayScore))
+                            .message(String.format("螺丝 %s 漏打/异常 (中心 边缘%.2f 灰度%.2f)",
+                                    sp.getId() == null ? "?" : sp.getId(), centerEdge, centerGray))
                             .build());
                 }
             }
@@ -78,8 +102,8 @@ public final class ScrewDetector {
         }
     }
 
-    /** 裁出 search/patch 子图后调用 EdgeUtil 匹配，返回最大归一化相关得分。 */
-    private static double matchScore(Mat searchImg, Mat patchImg, Rect searchRect, Rect patchRect) {
+    /** 裁出 search/patch 子图后匹配，返回最大归一化相关得分。 */
+    private static double crop2Match(Mat searchImg, Rect searchRect, Mat patchImg, Rect patchRect) {
         Mat patch = new Mat(patchImg, patchRect);
         Mat search = new Mat(searchImg, searchRect);
         try {

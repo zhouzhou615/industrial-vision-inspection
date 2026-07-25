@@ -233,7 +233,7 @@ function draw(){
   ctx.lineWidth=2;
   screws.forEach((s,i)=>{
     ctx.strokeStyle='#e5484d';ctx.fillStyle='rgba(229,72,77,.25)';
-    ctx.beginPath();ctx.arc(s.x*scale,s.y*scale,Math.max(5,s.r*scale),0,7);ctx.fill();ctx.stroke();
+    ctx.beginPath();ctx.arc(s.x*scale,s.y*scale,Math.max(1,s.r*scale),0,7);ctx.fill();ctx.stroke();
     ctx.fillStyle='#fff';ctx.font='12px sans-serif';ctx.fillText(s.id,s.x*scale+s.r*scale+2,s.y*scale-2);
   });
   // Logo 框（多个）
