@@ -305,6 +305,7 @@ def capture_loop():
     frame_count = 0
     active_streak = 0      # 连续有料计数（进入防抖）
     inactive_streak = 0    # 连续无料计数（离开防抖）
+    item_start = 0.0       # 本件开始采集的时间戳（用于最长采集时长切件）
 
     while True:
         st_frame = MV_FRAME_OUT()
@@ -342,6 +343,7 @@ def capture_loop():
                     best_gray = None
                     best_sharp = -1.0
                     frame_count = 0
+                    item_start = time.time()
                     with state_lock:
                         stats["items"] += 1
                     set_tricolor(None)  # 工件进入→黄灯(运行中)，结果出来再变绿/红
@@ -354,9 +356,15 @@ def capture_loop():
                     if s > best_sharp:
                         best_sharp = s
                         best_gray = gray.copy()
-                # 连续确认无料 leave_confirm 帧，才认定“工件离开”
-                if inactive_streak >= CFG.leave_confirm:
-                    present = False
+
+                # 结束本件的两种情形：
+                #  a) 传感器确认无料（工件离开）
+                #  b) 采集时长达到上限（传感器一直有料时按固定节拍切件，便于测试/长工件）
+                leave = inactive_streak >= CFG.leave_confirm
+                timeout = CFG.max_seconds > 0 and (time.time() - item_start) >= CFG.max_seconds
+                if leave or timeout:
+                    reason = "工件离开" if leave else ("采集达 %.0f 秒" % CFG.max_seconds)
+                    print("[件#%d] %s，结束本件" % (stats["items"], reason))
                     if frame_count >= CFG.min_frames and best_gray is not None:
                         okj, encj = cv2.imencode(".jpg", best_gray,
                                                  [int(cv2.IMWRITE_JPEG_QUALITY), 92])
@@ -371,6 +379,18 @@ def capture_loop():
                                 print("[件#%d] Java 检测繁忙，跳过本件" % stats["items"])
                     elif frame_count > 0:
                         print("[件#%d] 采集帧数不足(%d)，丢弃" % (stats["items"], frame_count))
+
+                    if timeout and active:
+                        # 传感器仍有料：立刻作为“新一件”继续，实现连续循环检测
+                        best_gray = None
+                        best_sharp = -1.0
+                        frame_count = 0
+                        item_start = time.time()
+                        with state_lock:
+                            stats["items"] += 1
+                        print("[件#%d] 传感器仍有料，开始新一件采集…" % stats["items"])
+                    else:
+                        present = False
         except Exception as e:
             # 单帧异常不许搞垮整个采图线程（7×24 稳定性）
             print("采图处理异常(已忽略本帧): %s" % e)
@@ -439,6 +459,8 @@ def main():
     ap.add_argument("--min-frames", type=int, default=3, help="一件至少采集多少帧才判定")
     ap.add_argument("--enter-confirm", type=int, default=3, help="连续多少帧有料才确认工件进入(防抖，去信号毛刺)")
     ap.add_argument("--leave-confirm", type=int, default=4, help="连续多少帧无料才确认工件离开(防抖)")
+    ap.add_argument("--max-seconds", type=float, default=0,
+                    help="单件最长采集秒数：传感器一直有料时，每满该秒数自动结束本件并开始新一件；0=不限(仅靠传感器分件)")
     ap.add_argument("--light", type=int, default=1, help="1=启用三色灯(继电器)，0=不控制")
     ap.add_argument("--relay-port", type=str, default="COM7", help="继电器模块串口，如 COM7")
     ap.add_argument("--relay-baud", type=int, default=9600, help="继电器波特率(常见9600/115200)")
