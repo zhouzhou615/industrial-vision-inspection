@@ -8,6 +8,7 @@ import com.vision.inspect.detect.DefectAnnotator;
 import com.vision.inspect.detect.ImageAligner;
 import com.vision.inspect.detect.LogoInspector;
 import com.vision.inspect.detect.ScrewDetector;
+import com.vision.inspect.detect.ScrewPatternDetector;
 import com.vision.inspect.model.Defect;
 import com.vision.inspect.model.InspectResult;
 import com.vision.inspect.model.InspectionSpec;
@@ -139,8 +140,9 @@ public class PlateInspectService {
 
             List<Defect> defects = new ArrayList<>();
 
-            // 1. 螺丝漏打
-            List<Defect> screwDefects = ScrewDetector.detect(templateGray, alignedGray, spec);
+            // 1. 螺丝漏打（几何图案匹配：用螺丝自身定位，不依赖整图对齐，可精确指出哪一颗）
+            ScrewPatternDetector.Result screwResult = ScrewPatternDetector.detect(alignedGray, spec);
+            List<Defect> screwDefects = screwResult.defects;
             defects.addAll(screwDefects);
             int screwExpected = spec.getScrews().size();
             int screwMissing = screwDefects.size();
@@ -175,7 +177,8 @@ public class PlateInspectService {
             boolean passed = defects.isEmpty();
 
             // 3. 标注缺陷图（同时画出被检测的区域，便于确认改动是否落在检测区）
-            annotated = DefectAnnotator.annotate(aligned, defects, spec);
+            annotated = DefectAnnotator.annotate(aligned, defects, spec,
+                    screwResult.dx, screwResult.dy);
             Path capturePath = saveImage(productCode, "capture", captured);
             Path annotatedPath = saveImage(productCode, "annotated", annotated);
 

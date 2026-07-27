@@ -25,14 +25,29 @@ public final class DefectAnnotator {
     private DefectAnnotator() {
     }
 
-    /** 先画出所有被检测的区域（淡色），再叠加缺陷标注。 */
     public static Mat annotate(Mat alignedColor, List<Defect> defects, InspectionSpec spec) {
+        return annotate(alignedColor, defects, spec, 0, 0);
+    }
+
+    /**
+     * 先画出所有被检测的区域（淡色），再叠加缺陷标注。
+     *
+     * @param dx,dy 图案配准平移量：把示教坐标映射到采图中工件的真实位置，
+     *              使检测圈准确落在实际螺丝上（而不是固定在标准图坐标）。
+     */
+    public static Mat annotate(Mat alignedColor, List<Defect> defects, InspectionSpec spec,
+                               double dx, double dy) {
         Mat out = alignedColor.clone();
         int thickness = Math.max(2, out.cols() / 700);
+        int ox = (int) Math.round(dx);
+        int oy = (int) Math.round(dy);
         if (spec != null) {
             if (spec.getScrews() != null) {
                 for (ScrewPoint s : spec.getScrews()) {
-                    Imgproc.circle(out, new Point(s.getX(), s.getY()), Math.max(6, s.getR()), CYAN, 1);
+                    Imgproc.circle(out, new Point(s.getX() + ox, s.getY() + oy),
+                            Math.max(6, s.getR()), CYAN, 1);
+                    putLabel(out, s.getId() == null ? "" : s.getId(),
+                            s.getX() + ox + s.getR(), s.getY() + oy - s.getR(), 1, CYAN);
                 }
             }
             if (spec.getLogos() != null) {

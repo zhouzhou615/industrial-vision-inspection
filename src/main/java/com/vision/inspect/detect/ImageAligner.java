@@ -9,6 +9,7 @@ import org.opencv.core.MatOfDMatch;
 import org.opencv.core.MatOfKeyPoint;
 import org.opencv.core.MatOfPoint2f;
 import org.opencv.core.Point;
+import org.opencv.core.RotatedRect;
 import org.opencv.core.Size;
 import org.opencv.core.TermCriteria;
 import org.opencv.features2d.DescriptorMatcher;
@@ -41,6 +42,15 @@ public final class ImageAligner {
         Mat tGray = enhance(templateColor);
         Mat cGray = enhance(capResized);
         try {
+            // 0. 工件轮廓定位（首选）：工件为亮区、背景暗，边界对比强，
+            //    比在大片均匀表面上找 ORB 特征稳得多 —— 相当于 VisionMaster 的“定位+位置修正”。
+            Mat Mc = tryContourAffine(tGray, cGray);
+            if (Mc != null) {
+                Mat warped = new Mat();
+                Imgproc.warpAffine(capResized, warped, Mc, size);
+                Mc.release();
+                return warped;
+            }
             // 1. ORB 仿射对齐（抗大角度旋转）
             Mat M = tryOrbAffine(tGray, cGray);
             if (M != null) {
@@ -75,6 +85,85 @@ public final class ImageAligner {
         CLAHE clahe = Imgproc.createCLAHE(2.0, new Size(8, 8));
         clahe.apply(gray, gray);
         return gray;
+    }
+
+    /**
+     * 工件轮廓定位：在标准图与采图中各自找出“工件”（画面中最大的亮区），
+     * 用其最小外接矩形的中心/角度/尺度，算出 采图→标准图 的相似变换。
+     * 适合“亮工件 + 暗背景”的场景，不依赖表面纹理。
+     * @return 2x3 仿射矩阵；找不到可靠工件则返回 null。
+     */
+    private static Mat tryContourAffine(Mat tGray, Mat cGray) {
+        try {
+            RotatedRect rt = findWorkpiece(tGray);
+            RotatedRect rc = findWorkpiece(cGray);
+            if (rt == null || rc == null) {
+                return null;
+            }
+            // 尺度：用矩形长边之比（长边比短边稳定）
+            double lt = Math.max(rt.size.width, rt.size.height);
+            double lc = Math.max(rc.size.width, rc.size.height);
+            if (lt < 20 || lc < 20) {
+                return null;
+            }
+            double scale = lt / lc;
+            if (scale < 0.5 || scale > 2.0) {
+                return null;
+            }
+            // 角度差：归一到 [-45,45]，避免长短边互换造成的 90° 跳变
+            double da = normAngle(rt.angle - rc.angle);
+            // 以采图工件中心为旋转中心做“旋转+缩放”，再平移到标准图工件中心
+            Mat M = Imgproc.getRotationMatrix2D(rc.center, da, scale);
+            M.put(0, 2, M.get(0, 2)[0] + (rt.center.x - rc.center.x));
+            M.put(1, 2, M.get(1, 2)[0] + (rt.center.y - rc.center.y));
+            return M;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 找画面中最大的亮区（即工件），返回其最小外接矩形；面积过小则返回 null。 */
+    private static RotatedRect findWorkpiece(Mat gray) {
+        Mat bin = new Mat();
+        // Otsu 自动阈值：亮工件 → 白，暗背景 → 黑
+        Imgproc.threshold(gray, bin, 0, 255, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU);
+        Mat k = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(9, 9));
+        Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_CLOSE, k);   // 填掉工件内部的孔洞/网点
+        Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_OPEN, k);    // 去掉零散噪点
+        List<org.opencv.core.MatOfPoint> contours = new ArrayList<>();
+        Imgproc.findContours(bin, contours, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+        bin.release();
+        k.release();
+
+        double best = 0;
+        RotatedRect bestRect = null;
+        double imgArea = (double) gray.cols() * gray.rows();
+        for (org.opencv.core.MatOfPoint c : contours) {
+            double a = Imgproc.contourArea(c);
+            if (a > best) {
+                MatOfPoint2f c2f = new MatOfPoint2f(c.toArray());
+                RotatedRect rr = Imgproc.minAreaRect(c2f);
+                c2f.release();
+                best = a;
+                bestRect = rr;
+            }
+        }
+        // 工件应占画面相当比例，太小说明没找到（可能背景太亮/工件不在画面）
+        if (bestRect == null || best < 0.05 * imgArea) {
+            return null;
+        }
+        return bestRect;
+    }
+
+    /** 把角度归一到 [-45,45]，消除 minAreaRect 长短边互换带来的 90° 跳变。 */
+    private static double normAngle(double a) {
+        while (a <= -45) {
+            a += 90;
+        }
+        while (a > 45) {
+            a -= 90;
+        }
+        return a;
     }
 
     /**
