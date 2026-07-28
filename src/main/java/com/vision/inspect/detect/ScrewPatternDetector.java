@@ -7,6 +7,7 @@ import org.opencv.core.Mat;
 import org.opencv.core.MatOfPoint;
 import org.opencv.core.MatOfPoint2f;
 import org.opencv.core.Point;
+import org.opencv.core.Rect;
 import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
 import org.slf4j.Logger;
@@ -51,7 +52,7 @@ public final class ScrewPatternDetector {
      * @param spec        检测配置（含示教的螺丝点阵）
      * @return 漏打螺丝的缺陷列表
      */
-    public static Result detect(Mat alignedGray, InspectionSpec spec) {
+    public static Result detect(Mat templateGray, Mat alignedGray, InspectionSpec spec) {
         List<Defect> defects = new ArrayList<>();
         List<ScrewPoint> screws = spec.getScrews();
         if (screws == null || screws.isEmpty()) {
@@ -74,15 +75,30 @@ public final class ScrewPatternDetector {
         // 2. 投票求最佳平移：让示教点阵套到候选点上
         // 判定容差：有螺丝时候选点几乎重合(个位数px)，无螺丝时最近的只能是旁边网点(远得多)，
         // 故取约 1 倍螺丝半径即可清晰区分；过大会让邻近网点冒充螺丝导致漏检。
-        double tol = Math.max(6, rBase * 1.0);
-        double[] shift = bestShift(screws, candidates, tol);
-        log.info("  图案配准平移 dx={} dy={} (容差 {}px)",
-                Math.round(shift[0]), Math.round(shift[1]), Math.round(tol));
+        // 判定容差：实测“有螺丝”残差约 3~17px（纯平移无法完美贴合轻微旋转/透视），
+        // 而“真漏打”时最近的只能是较远的网点(58px 起)，故取约 25px 可清晰区分且留足余量。
+        double tol = Math.max(25, rBase * 3.5);
+        // 配准用宽容差（容忍整体微小偏差，避免丢票导致在歧义解间乱跳）；判定仍用上面的紧容差
+        double regTol = Math.max(20, rBase * 2.5);
+        // 限制最大位移：工件不会跑出画面一半以上，据此排除“隔一个点阵周期”的歧义解
+        double maxShift = Math.max(alignedGray.cols(), alignedGray.rows()) * 0.35;
+        double[] shift = bestShift(screws, candidates, regTol, maxShift);
+        log.info("  图案配准平移 dx={} dy={} (配准容差{}px, 判定容差{}px, 最大位移{}px)",
+                Math.round(shift[0]), Math.round(shift[1]),
+                Math.round(regTol), Math.round(tol), Math.round(maxShift));
 
-        // 3. 逐颗核对
+        // 3. 逐颗核对：位置 + 外观 双判据
+        //    位置：附近有没有候选暗斑（无 → 肯定漏打）
+        //    外观：与标准图同位置比对（螺丝孔虽也是暗斑，但与“有螺丝”长得不同 → 区分关键）
+        double minScore = spec.getScrewMinScore() > 0 ? spec.getScrewMinScore() : 0.6;
+        // 3.5 用配准上的螺丝对估计「旋转+缩放+平移」仿射，压掉边缘螺丝的残差
+        //     （纯平移无法补偿轻微旋转/透视，离中心越远误差越大）
+        Mat affine = estimateAffine(screws, candidates, shift, regTol);
+
         for (ScrewPoint sp : screws) {
-            double ex = sp.getX() + shift[0];
-            double ey = sp.getY() + shift[1];
+            double[] p = mapPoint(affine, sp.getX(), sp.getY(), shift);
+            double ex = p[0];
+            double ey = p[1];
             double best = Double.MAX_VALUE;
             for (Point c : candidates) {
                 double d = Math.hypot(c.x - ex, c.y - ey);
@@ -90,16 +106,126 @@ public final class ScrewPatternDetector {
                     best = d;
                 }
             }
-            boolean present = best <= tol;
-            log.info("  螺丝 {} 最近候选点距离={}px (容差{}px) -> {}",
-                    sp.getId(), Math.round(best), Math.round(tol), present ? "有螺丝" : "漏打");
+            boolean nearOk = best <= tol;
+            double score = appearanceScore(templateGray, alignedGray, sp, ex, ey, rBase, tol);
+            boolean present = nearOk && score >= minScore;
+            log.info("  螺丝 {} 最近候选点={}px(容差{}) 外观得分={}(阈值{}) -> {}",
+                    sp.getId(), Math.round(best), Math.round(tol),
+                    String.format("%.2f", score), minScore, present ? "有螺丝" : "漏打");
             if (!present) {
-                // 缺陷画在采图的真实位置（示教坐标 + 配准平移）
-                defects.add(missing(sp, shift[0], shift[1], rBase,
-                        String.format("该位置无螺丝特征(最近%.0fpx)", best)));
+                String why = !nearOk
+                        ? String.format("该位置无螺丝特征(最近%.0fpx)", best)
+                        : String.format("外观不符,疑似空孔(得分%.2f<%.2f)", score, minScore);
+                // 缺陷画在采图的真实位置（经仿射映射后的位置）
+                defects.add(missing(sp, ex - sp.getX(), ey - sp.getY(), rBase, why));
             }
         }
         return new Result(defects, shift[0], shift[1]);
+    }
+
+    /**
+     * 外观比对：取标准图该螺丝处的小图，在采图配准位置附近做归一化匹配。
+     * 有螺丝 → 与标准图长得一样，得分高；被拆掉只剩空孔 → 外观不同，得分低。
+     * 同时用灰度与边缘两路取最优，兼顾光照变化。
+     */
+    /**
+     * 用「配准上的螺丝对」估计部分仿射（旋转+等比缩放+平移）。
+     * 纯平移无法补偿轻微旋转/透视，会让边缘螺丝残差偏大；仿射能把残差压到几像素。
+     * @return 2x3 仿射矩阵；点对不足或不合理时返回 null（退回纯平移）。
+     */
+    private static Mat estimateAffine(List<ScrewPoint> screws, List<Point> candidates,
+                                      double[] shift, double regTol) {
+        List<Point> from = new ArrayList<>();
+        List<Point> to = new ArrayList<>();
+        for (ScrewPoint sp : screws) {
+            double ex = sp.getX() + shift[0];
+            double ey = sp.getY() + shift[1];
+            double bd = Double.MAX_VALUE;
+            Point bp = null;
+            for (Point c : candidates) {
+                double d = Math.hypot(c.x - ex, c.y - ey);
+                if (d < bd) {
+                    bd = d;
+                    bp = c;
+                }
+            }
+            if (bp != null && bd <= regTol) {
+                from.add(new Point(sp.getX(), sp.getY()));
+                to.add(bp);
+            }
+        }
+        if (from.size() < 3) {
+            return null;
+        }
+        try {
+            MatOfPoint2f f = new MatOfPoint2f(from.toArray(new Point[0]));
+            MatOfPoint2f t = new MatOfPoint2f(to.toArray(new Point[0]));
+            Mat m = org.opencv.calib3d.Calib3d.estimateAffinePartial2D(f, t);
+            f.release();
+            t.release();
+            if (m == null || m.empty() || m.rows() != 2) {
+                return null;
+            }
+            // 合理性：缩放接近 1、旋转很小，否则多半是误配
+            double sc = Math.hypot(m.get(0, 0)[0], m.get(1, 0)[0]);
+            if (sc < 0.9 || sc > 1.1) {
+                m.release();
+                return null;
+            }
+            return m;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 用仿射矩阵映射点；矩阵为空则退回纯平移。 */
+    private static double[] mapPoint(Mat m, double x, double y, double[] shift) {
+        if (m == null) {
+            return new double[]{x + shift[0], y + shift[1]};
+        }
+        double nx = m.get(0, 0)[0] * x + m.get(0, 1)[0] * y + m.get(0, 2)[0];
+        double ny = m.get(1, 0)[0] * x + m.get(1, 1)[0] * y + m.get(1, 2)[0];
+        return new double[]{nx, ny};
+    }
+
+    private static double appearanceScore(Mat templateGray, Mat alignedGray,
+                                          ScrewPoint sp, double ex, double ey, int rBase, double tol) {
+        int r = Math.max(4, sp.getR() > 0 ? sp.getR() : rBase);
+        int cols = templateGray.cols();
+        int rows = templateGray.rows();
+        // 标准图 patch
+        Rect pr = clamp(sp.getX() - r, sp.getY() - r, 2 * r, 2 * r, cols, rows);
+        // 采图搜索窗：余量必须 ≥ 全局配准残差(可达 20px)，否则螺丝落在窗外会误判为“外观不符”。
+        // 窗内做局部重定位，得分才真正反映“有无螺丝”而非“对齐误差”。
+        int m = (int) Math.max(tol, r * 2);
+        Rect sr = clamp((int) Math.round(ex) - r - m,
+                (int) Math.round(ey) - r - m,
+                2 * r + 2 * m, 2 * r + 2 * m, alignedGray.cols(), alignedGray.rows());
+        if (pr.width < 4 || pr.height < 4 || sr.width <= pr.width || sr.height <= pr.height) {
+            return 1.0; // 越界无法比对时不误判
+        }
+        Mat patch = new Mat(templateGray, pr);
+        Mat search = new Mat(alignedGray, sr);
+        Mat pe = EdgeUtil.gradient(patch);
+        Mat se = EdgeUtil.gradient(search);
+        try {
+            double gray = EdgeUtil.matchScore(search, patch);
+            double edge = EdgeUtil.matchScore(se, pe);
+            return Math.max(gray, edge);
+        } finally {
+            patch.release();
+            search.release();
+            pe.release();
+            se.release();
+        }
+    }
+
+    private static Rect clamp(int x, int y, int w, int h, int cols, int rows) {
+        int nx = Math.max(0, Math.min(x, cols - 1));
+        int ny = Math.max(0, Math.min(y, rows - 1));
+        int nw = Math.max(1, Math.min(w, cols - nx));
+        int nh = Math.max(1, Math.min(h, rows - ny));
+        return new Rect(nx, ny, nw, nh);
     }
 
     private static Defect missing(ScrewPoint sp, double dx, double dy, int rBase, String why) {
@@ -160,16 +286,23 @@ public final class ScrewPatternDetector {
      * 投票法求最佳平移：枚举“每个示教点 → 每个候选点”的平移假设，
      * 取能让最多示教点找到候选点的那个平移。
      */
-    private static double[] bestShift(List<ScrewPoint> screws, List<Point> candidates, double tol) {
+    private static double[] bestShift(List<ScrewPoint> screws, List<Point> candidates, double tol,
+                                      double maxShift) {
         double bestDx = 0;
         double bestDy = 0;
         int bestVotes = -1;
         double bestErr = Double.MAX_VALUE;
+        double bestMag = Double.MAX_VALUE;
 
         for (ScrewPoint sp : screws) {
             for (Point c : candidates) {
                 double dx = c.x - sp.getX();
                 double dy = c.y - sp.getY();
+                double mag = Math.hypot(dx, dy);
+                // 工件不会跑太远：超出允许位移的假设直接丢弃，消除“隔一个点阵周期”的歧义解
+                if (mag > maxShift) {
+                    continue;
+                }
                 int votes = 0;
                 double err = 0;
                 for (ScrewPoint s2 : screws) {
@@ -187,15 +320,47 @@ public final class ScrewPatternDetector {
                         err += best;
                     }
                 }
-                // 票数优先，票数相同取总误差小的
-                if (votes > bestVotes || (votes == bestVotes && err < bestErr)) {
+                // 票数优先；票数相同时用「误差 + 位移惩罚」比较：
+                // 规则点阵会产生“平移一个周期也能对上”的歧义解，其票数与真实解相同，
+                // 但位移大得多，故对位移加惩罚，优先选更接近原位的解。
+                double cost = err + mag * 0.1;
+                double bestCost = bestErr + bestMag * 0.1;
+                if (votes > bestVotes || (votes == bestVotes && cost < bestCost)) {
                     bestVotes = votes;
                     bestErr = err;
+                    bestMag = mag;
                     bestDx = dx;
                     bestDy = dy;
                 }
             }
         }
+        // 用所有内点的平均偏移精修，减小单点误差带来的整体偏移
+        double sx = 0;
+        double sy = 0;
+        int n = 0;
+        for (ScrewPoint s2 : screws) {
+            double ex = s2.getX() + bestDx;
+            double ey = s2.getY() + bestDy;
+            double bd = Double.MAX_VALUE;
+            Point bp = null;
+            for (Point c2 : candidates) {
+                double d = Math.hypot(c2.x - ex, c2.y - ey);
+                if (d < bd) {
+                    bd = d;
+                    bp = c2;
+                }
+            }
+            if (bp != null && bd <= tol) {
+                sx += bp.x - s2.getX();
+                sy += bp.y - s2.getY();
+                n++;
+            }
+        }
+        if (n >= 2) {
+            bestDx = sx / n;
+            bestDy = sy / n;
+        }
+        log.info("  配准命中 {}/{} 颗", bestVotes, screws.size());
         return new double[]{bestDx, bestDy};
     }
 

@@ -141,7 +141,8 @@ public class PlateInspectService {
             List<Defect> defects = new ArrayList<>();
 
             // 1. 螺丝漏打（几何图案匹配：用螺丝自身定位，不依赖整图对齐，可精确指出哪一颗）
-            ScrewPatternDetector.Result screwResult = ScrewPatternDetector.detect(alignedGray, spec);
+            ScrewPatternDetector.Result screwResult =
+                    ScrewPatternDetector.detect(templateGray, alignedGray, spec);
             List<Defect> screwDefects = screwResult.defects;
             defects.addAll(screwDefects);
             int screwExpected = spec.getScrews().size();
