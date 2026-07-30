@@ -70,8 +70,11 @@ ACTIVE_PRODUCT = None   # 跟随网页「工程配方」启用的配方编码
 # 运行时共享状态
 state_lock = threading.Lock()
 post_busy = threading.Lock()  # 保证同一时刻只有一个 Java 检测请求，避免堆积超时
-latest_jpeg = None            # 最新一帧（供 /grab）
+latest_jpeg = None            # 最新一帧（供 /grab，保持干净原图：网页要用它存标准图）
+fov_jpeg = None               # 带视野状态标注的一帧（供 /fov 调试）
 sensor_active = False         # 当前传感器是否有料
+fov_now = "none"              # 当前工件在视野中的状态（none/partial/full）
+fov_box_now = None            # 当前工件外接框 (x,y,w,h,面积占比)
 stats = {"items": 0, "sent": 0, "last": None}
 
 
@@ -271,6 +274,84 @@ def sharpness(gray):
     return cv2.Laplacian(small, cv2.CV_64F).var()
 
 
+# ==== 视野门控：只在工件「完整进入视野」时采图 ====
+#
+# 流水线上工件是运动的，进入/离开画面时都会被画面边界裁断。裁断的工件不能用于检测：
+#  - 工件外轮廓被截断 → 定位基准失真
+#  - 缺了一部分 → 那一部分的螺丝位根本不在图上，必然误报漏打
+# 因此按「工件外接框是否四边都离画面边界有余量」来决定采不采。
+
+FOV_NONE = "none"        # 画面里没有工件
+FOV_PARTIAL = "partial"  # 工件在画面里，但贴到边界 —— 尚未完整进入，或已开始离开
+FOV_FULL = "full"        # 工件完整在画面内，四边都有余量 —— 可以检测
+
+
+def workpiece_bbox(gray):
+    """
+    找工件外接框。工件是亮区、背景暗，用 Otsu 自动阈值取最大亮区。
+
+    为省时间在约 320px 宽的缩略图上做（判断"是否贴边"不需要高分辨率），
+    再把坐标换算回传入图的坐标系。
+
+    :return: (x, y, w, h, 面积占画面比例)，找不到轮廓时返回 None
+    """
+    h0, w0 = gray.shape[:2]
+    k = 320.0 / w0 if w0 > 320 else 1.0
+    small = (cv2.resize(gray, (0, 0), fx=k, fy=k, interpolation=cv2.INTER_AREA)
+             if k < 1.0 else gray)
+    _, bw = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ker = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, ker)   # 填掉工件内部网点/孔洞
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, ker)    # 去掉零散噪点
+    cnts = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    sh, sw = small.shape[:2]
+    ratio = cv2.contourArea(c) / float(sw * sh)
+    x, y, w, h = cv2.boundingRect(c)
+    inv = (1.0 / k) if k < 1.0 else 1.0
+    return (int(x * inv), int(y * inv), int(w * inv), int(h * inv), ratio)
+
+
+def fov_state(gray):
+    """
+    判断工件在视野中的状态，返回 (状态, 外接框)。
+
+    余量 --fov-margin 取多大：至少要盖住工件边缘的检测/分割抖动，
+    太小会在"刚好齐边"时反复跳 full/partial，太大则工件必须离边界很远才肯采图。
+    """
+    box = workpiece_bbox(gray)
+    if box is None:
+        return FOV_NONE, None
+    x, y, w, h, ratio = box
+    if ratio < CFG.fov_min_area:
+        return FOV_NONE, box          # 亮区太小：视为画面里没有工件
+    m = CFG.fov_margin
+    ih, iw = gray.shape[:2]
+    full = (x >= m and y >= m and (x + w) <= (iw - m) and (y + h) <= (ih - m))
+    return (FOV_FULL if full else FOV_PARTIAL), box
+
+
+def fov_overlay_jpeg(gray, state, box):
+    """把视野状态和外接框画在图上，供 /fov 调试用（不污染 /grab 的干净原图）。"""
+    vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    ih, iw = gray.shape[:2]
+    m = CFG.fov_margin
+    # 画出"必须留出的余量"边界：工件框碰到这条线就算贴边
+    cv2.rectangle(vis, (m, m), (iw - m, ih - m), (0, 200, 255), 1)
+    color = {FOV_FULL: (0, 220, 0), FOV_PARTIAL: (0, 165, 255), FOV_NONE: (128, 128, 128)}[state]
+    if box is not None:
+        x, y, w, h, ratio = box
+        cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(vis, "%s  area=%.3f" % (state, ratio), (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    else:
+        cv2.putText(vis, state, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    ok, enc = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return enc.tobytes() if ok else None
+
+
 def light_sync_loop():
     """
     三色灯跟随界面状态：工件进入检测区(尚无结果)=黄「进行中」，
@@ -380,15 +461,24 @@ def _post_and_release(jpg_bytes, frame_count):
 
 
 def capture_loop():
-    """连续取帧 + LineStatus 状态机分件。"""
-    global latest_jpeg, sensor_active
+    """
+    连续取帧 + 分件状态机。
+
+    <b>分件依据由 --gate 决定：</b>
+      vision  只看画面：工件<b>完整进入视野</b>才开始采集，开始<b>离开视野</b>就结束本件（默认）
+      sensor  只看光电传感器 LineStatus（原有行为）
+      both    两者同时满足才采集（传感器定位置、视觉保证完整）
+    """
+    global latest_jpeg, fov_jpeg, sensor_active, fov_now, fov_box_now
     present = False
     best_gray = None
     best_sharp = -1.0
     frame_count = 0
-    active_streak = 0      # 连续有料计数（进入防抖）
-    inactive_streak = 0    # 连续无料计数（离开防抖）
+    active_streak = 0      # 连续"在检测区"计数（进入防抖）
+    inactive_streak = 0    # 连续"不在检测区"计数（离开防抖）
     item_start = 0.0       # 本件开始采集的时间戳（用于最长采集时长切件）
+    need_clear = False     # 本件因"工件离开"结束后，要求先看到工件完全离开画面再接下一件
+    last_state = None      # 上一帧的视野状态，用于只在变化时打日志
 
     while True:
         st_frame = MV_FRAME_OUT()
@@ -405,11 +495,47 @@ def capture_loop():
                 with state_lock:
                     latest_jpeg = enc.tobytes()
 
-            active = read_line_status()
-            if active is None:
-                active = True  # 读不到传感器时，退化为“一直有料”（可用 /grab 手动）
+            sensor = read_line_status()
+            if sensor is None:
+                sensor = True  # 读不到传感器时，退化为“一直有料”（可用 /grab 手动）
+
+            # 视野状态：sensor 模式下不需要，省掉这份计算
+            if CFG.gate == "sensor":
+                state, box = FOV_FULL, None
+            else:
+                state, box = fov_state(gray)
+                if state != last_state:
+                    if box is not None:
+                        print("  视野状态 %s -> %s (工件框 %dx%d @(%d,%d), 占画面 %.1f%%)"
+                              % (last_state, state, box[2], box[3], box[0], box[1],
+                                 box[4] * 100))
+                    else:
+                        print("  视野状态 %s -> %s (未检出工件)" % (last_state, state))
+                    last_state = state
+                if CFG.fov_debug:
+                    dbg = fov_overlay_jpeg(gray, state, box)
+                    if dbg:
+                        with state_lock:
+                            fov_jpeg = dbg
+
             with state_lock:
-                sensor_active = active
+                sensor_active = sensor
+                fov_now = state
+                fov_box_now = box
+
+            # 是否"在检测区"（可采集）：按门控方式组合两个条件
+            if CFG.gate == "sensor":
+                active = sensor
+            elif CFG.gate == "both":
+                active = sensor and (state == FOV_FULL)
+            else:                                  # vision
+                active = (state == FOV_FULL)
+
+            # 工件已完全离开画面 → 解除"等待清场"，允许接下一件
+            if need_clear and state == FOV_NONE:
+                need_clear = False
+            if need_clear:
+                active = False                     # 清场前不许开始新一件
 
             # 连续计数做防抖
             if active:
@@ -420,7 +546,7 @@ def capture_loop():
                 active_streak = 0
 
             if not present:
-                # 只有连续确认有料 enter_confirm 帧，才认定“新工件进入”，滤掉信号毛刺
+                # 只有连续确认 enter_confirm 帧，才认定“新工件完整进入”，滤掉边界抖动
                 if active_streak >= CFG.enter_confirm:
                     present = True
                     best_gray = None
@@ -430,9 +556,9 @@ def capture_loop():
                     with state_lock:
                         stats["items"] += 1
                     set_tricolor(None)  # 工件进入→黄灯(运行中)，结果出来再变绿/红
-                    print("[件#%d] 工件进入检测区，开始采集…" % stats["items"])
+                    print("[件#%d] 工件已完整进入视野，开始采集…" % stats["items"])
             else:
-                # 工件在检测区内：有料就累计最清晰帧（短暂掉料不结束）
+                # 工件完整在视野内：累计最清晰帧（短暂抖动不结束）
                 if active:
                     frame_count += 1
                     s = sharpness(gray)
@@ -441,12 +567,15 @@ def capture_loop():
                         best_gray = gray.copy()
 
                 # 结束本件的两种情形：
-                #  a) 传感器确认无料（工件离开）
-                #  b) 采集时长达到上限（传感器一直有料时按固定节拍切件，便于测试/长工件）
+                #  a) 工件开始离开视野 / 传感器无料（视门控方式而定）
+                #  b) 采集时长达到上限（工件长时间静止不动时按固定节拍切件，便于台面调试）
                 leave = inactive_streak >= CFG.leave_confirm
                 timeout = CFG.max_seconds > 0 and (time.time() - item_start) >= CFG.max_seconds
                 if leave or timeout:
-                    reason = "工件离开" if leave else ("采集达 %.0f 秒" % CFG.max_seconds)
+                    if leave:
+                        reason = ("工件开始离开视野" if CFG.gate != "sensor" else "传感器无料")
+                    else:
+                        reason = "采集达 %.0f 秒" % CFG.max_seconds
                     print("[件#%d] %s，结束本件" % (stats["items"], reason))
                     if frame_count >= CFG.min_frames and best_gray is not None:
                         okj, encj = cv2.imencode(".jpg", best_gray,
@@ -464,16 +593,21 @@ def capture_loop():
                         print("[件#%d] 采集帧数不足(%d)，丢弃" % (stats["items"], frame_count))
 
                     if timeout and active:
-                        # 传感器仍有料：立刻作为“新一件”继续，实现连续循环检测
+                        # 工件仍完整在视野内（台面静止调试）：立刻作为“新一件”继续，实现连续循环检测
                         best_gray = None
                         best_sharp = -1.0
                         frame_count = 0
                         item_start = time.time()
                         with state_lock:
                             stats["items"] += 1
-                        print("[件#%d] 传感器仍有料，开始新一件采集…" % stats["items"])
+                        print("[件#%d] 工件仍在视野内，开始新一件采集…" % stats["items"])
                     else:
                         present = False
+                        # 因离开而结束：要求先看到工件<b>完全离开画面</b>再接下一件。
+                        # 否则工件的后半截还在画面里晃动时可能又满足一次"完整进入"，
+                        # 同一个工件被检测两次。
+                        if leave and CFG.gate != "sensor":
+                            need_clear = True
         except Exception as e:
             # 单帧异常不许搞垮整个采图线程（7×24 稳定性）
             print("采图处理异常(已忽略本帧): %s" % e)
@@ -491,9 +625,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._text(200, "ok")
         if path == "/status":
             with state_lock:
+                box = fov_box_now
                 snap = {"sensorActive": sensor_active, "items": stats["items"],
-                        "sent": stats["sent"], "last": stats["last"]}
+                        "sent": stats["sent"], "last": stats["last"],
+                        "gate": CFG.gate, "fovState": fov_now,
+                        "fovBox": (None if box is None else
+                                   {"x": box[0], "y": box[1], "w": box[2], "h": box[3],
+                                    "areaRatio": round(box[4], 4)})}
             return self._json(200, snap)
+        if path == "/fov":
+            # 带视野状态标注的调试图（需 --fov-debug 1）。/grab 保持干净原图不受影响。
+            with state_lock:
+                jpg = fov_jpeg
+            if jpg is None:
+                return self._text(503, "尚无标注图（需启动参数 --fov-debug 1，且 --gate 非 sensor）")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpg)))
+            self.end_headers()
+            self.wfile.write(jpg)
+            return
         if path == "/grab":
             with state_lock:
                 jpg = latest_jpeg
@@ -536,15 +687,28 @@ def main():
     ap.add_argument("--java-url", type=str, default="http://127.0.0.1:8088")
     ap.add_argument("--line", type=str, default="Line0", help="传感器输入线，如 Line0/Line1")
     ap.add_argument("--active-high", type=int, default=1, help="1=高电平有料，0=低电平有料")
+    ap.add_argument("--gate", type=str, default="vision", choices=["vision", "sensor", "both"],
+                    help="分件依据：vision=工件完整进入视野才采(默认)；sensor=只看光电传感器；"
+                         "both=两者同时满足")
+    ap.add_argument("--fov-margin", type=int, default=12,
+                    help="视野余量(像素)：工件外接框四边都离画面边界至少这么远，才算「完整进入」。"
+                         "太小会在齐边时反复跳状态，太大则工件要离边界很远才肯采图")
+    ap.add_argument("--fov-min-area", type=float, default=0.05,
+                    help="工件最小面积占画面比例，低于此视为画面里没有工件(滤掉空传送带/噪点)")
+    ap.add_argument("--fov-debug", type=int, default=0,
+                    help="1=生成带视野状态标注的调试图，浏览器开 http://127.0.0.1:<port>/fov 查看")
     ap.add_argument("--strobe", type=int, default=1, help="1=启用补光频闪输出(曝光时打光)，0=不控制光源")
     ap.add_argument("--strobe-line", type=str, default="Line1", help="补光灯所接的相机输出线，如 Line1/Line2")
     ap.add_argument("--strobe-duration", type=int, default=0, help="频闪脉宽(微秒)，0=跟随曝光时长")
     ap.add_argument("--strobe-delay", type=int, default=0, help="频闪延迟(微秒)")
     ap.add_argument("--min-frames", type=int, default=3, help="一件至少采集多少帧才判定")
-    ap.add_argument("--enter-confirm", type=int, default=3, help="连续多少帧有料才确认工件进入(防抖，去信号毛刺)")
-    ap.add_argument("--leave-confirm", type=int, default=4, help="连续多少帧无料才确认工件离开(防抖)")
+    ap.add_argument("--enter-confirm", type=int, default=3,
+                    help="连续多少帧满足条件才确认工件进入(防抖)。工件速度快时调小，否则会错过完整进入的窗口")
+    ap.add_argument("--leave-confirm", type=int, default=4,
+                    help="连续多少帧不满足条件才确认工件离开(防抖)")
     ap.add_argument("--max-seconds", type=float, default=0,
-                    help="单件最长采集秒数：传感器一直有料时，每满该秒数自动结束本件并开始新一件；0=不限(仅靠传感器分件)")
+                    help="单件最长采集秒数：工件长时间停在视野内时，每满该秒数自动结束本件并开始新一件；"
+                         "0=不限(仅靠进入/离开分件)。流水线上工件会自己走过，一般设 0")
     ap.add_argument("--max-width", type=int, default=1200,
                     help="输出图像最大宽度：相机原始5120过大会让螺丝候选点暴增、配准不稳，"
                          "在源头缩到此宽度(默认1200，螺丝约7px)。0=不缩放")
@@ -554,6 +718,11 @@ def main():
     ap.add_argument("--beep", type=int, default=1, help="NG 时是否鸣蜂鸣器(out4)，1=响 0=不响")
     CFG = ap.parse_args()
     CFG.active_high = bool(CFG.active_high)
+    CFG.fov_debug = bool(CFG.fov_debug)
+    print("分件依据: --gate %s%s" % (
+        CFG.gate,
+        ("（工件外接框四边距画面边界 ≥%dpx 且面积占比 ≥%.1f%% 才算完整进入）"
+         % (CFG.fov_margin, CFG.fov_min_area * 100)) if CFG.gate != "sensor" else ""))
 
     open_camera(CFG)
     relay_open()       # 打开继电器串口（三色灯）
@@ -562,7 +731,7 @@ def main():
     threading.Thread(target=light_sync_loop, daemon=True).start()  # 三色灯跟随界面状态
     try:
         server = ThreadingHTTPServer(("127.0.0.1", CFG.port), Handler)
-        print("采图服务已启动: http://127.0.0.1:%d  (/health /grab /status)" % CFG.port)
+        print("采图服务已启动: http://127.0.0.1:%d  (/health /grab /status /fov)" % CFG.port)
         server.serve_forever()
     finally:
         if cam is not None:
