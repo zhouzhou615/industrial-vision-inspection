@@ -29,7 +29,7 @@ import threading
 import time
 from ctypes import c_bool
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import urllib.request
 
 # ==== 让 Python 找到 MVS SDK 的核心运行库 MvCameraControl.dll ====
@@ -65,6 +65,7 @@ import cv2
 
 cam = None
 CFG = None
+ACTIVE_PRODUCT = None   # 跟随网页「工程配方」启用的配方编码
 
 # 运行时共享状态
 state_lock = threading.Lock()
@@ -141,7 +142,8 @@ def open_camera(cfg):
         print("警告: 设置 LineSelector=%s 失败(%s)，仍尝试读取 LineStatus" % (cfg.line, e))
 
     check(cam.MV_CC_StartGrabbing(), "开始取流")
-    print("相机已就绪（连续采集），传感器线: %s，工件产品号: %s" % (cfg.line, cfg.product))
+    print("相机已就绪（连续采集），传感器线: %s，配方: %s"
+          % (cfg.line, cfg.product if cfg.product else "自动跟随网页启用的配方"))
 
 
 # ==== 三色灯：中盛 ZS-8I0-R-10A 八路继电器模块（Modbus RTU / RS232/485）====
@@ -242,13 +244,25 @@ def read_line_status():
 
 
 def frame_to_gray(st_frame):
-    """MV_FRAME_OUT -> numpy 灰度图（Mono8 单通道相机）。"""
+    """
+    MV_FRAME_OUT -> numpy 灰度图（Mono8 单通道相机）。
+
+    相机原始分辨率很高（如 5120×5120），会导致工件表面细密网点被过度分辨、
+    螺丝候选点暴增到近千个而使图案配准不稳定。因此在源头按 --max-width 缩小，
+    标准图与采图统一为该尺寸，螺丝在图上约 7px，检测既稳又快。
+    """
     w = st_frame.stFrameInfo.nWidth
     h = st_frame.stFrameInfo.nHeight
     n = st_frame.stFrameInfo.nFrameLen
     buf = ctypes.string_at(st_frame.pBufAddr, n)
     # Mono8 与其它单通道格式都按灰度 reshape
-    return np.frombuffer(buf, dtype=np.uint8).reshape(h, w)
+    gray = np.frombuffer(buf, dtype=np.uint8).reshape(h, w)
+    mw = getattr(CFG, "max_width", 0) or 0
+    if mw > 0 and w > mw:
+        k = mw / float(w)
+        gray = cv2.resize(gray, (int(round(w * k)), int(round(h * k))),
+                          interpolation=cv2.INTER_AREA)
+    return gray
 
 
 def sharpness(gray):
@@ -257,9 +271,77 @@ def sharpness(gray):
     return cv2.Laplacian(small, cv2.CV_64F).var()
 
 
+def light_sync_loop():
+    """
+    三色灯跟随界面状态：工件进入检测区(尚无结果)=黄「进行中」，
+    检测结果 OK=绿、NG=红。与网页「视觉检测」页显示保持一致。
+    """
+    last = "init"
+    while True:
+        try:
+            with state_lock:
+                active = sensor_active
+                last_res = stats.get("last")
+            if active and not last_res_is_fresh():
+                want = "busy"
+            elif last_res is not None:
+                want = "ok" if last_res.get("passed") else "ng"
+            else:
+                want = "busy" if active else "idle"
+
+            if want != last:
+                if want == "ok":
+                    set_tricolor(True)
+                elif want == "ng":
+                    set_tricolor(False)
+                else:
+                    set_tricolor(None)      # 黄=进行中/待料
+                last = want
+        except Exception as e:
+            print("三色灯同步异常: %s" % e)
+        time.sleep(0.5)
+
+
+def last_res_is_fresh():
+    """本件是否已经出结果（用于区分「进行中」与「已出结果」）。"""
+    with state_lock:
+        return stats.get("result_for_item") == stats.get("items")
+
+
+def fetch_active_product():
+    """从 Java 拉取当前启用的工程配方编码；失败或未启用则返回 None。"""
+    try:
+        url = "%s/api/v1/recipe/active" % CFG.java_url.rstrip("/")
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        code = data.get("code")
+        return code if code else None
+    except Exception:
+        return None
+
+
+def current_product():
+    """
+    当前检测使用的配方编码。
+    默认跟随「工程配方」页启用的配方；用 --product 显式指定时以命令行为准。
+    """
+    global ACTIVE_PRODUCT
+    if CFG.product:                 # 命令行显式指定 → 固定使用
+        return CFG.product
+    code = fetch_active_product()
+    if code and code != ACTIVE_PRODUCT:
+        print("已切换到启用配方: %s" % code)
+        ACTIVE_PRODUCT = code
+    return ACTIVE_PRODUCT
+
+
 def post_frame_to_java(jpg_bytes, frame_count):
     """把最清晰帧以 multipart 上传到 Java 检测接口。"""
-    url = "%s/api/v1/inspect/%s/plate/frame" % (CFG.java_url.rstrip("/"), CFG.product)
+    product = current_product()
+    if not product:
+        print("未指定配方：请在网页「工程配方」页启用一个配方，或用 --product 指定")
+        return
+    url = "%s/api/v1/inspect/%s/plate/frame" % (CFG.java_url.rstrip("/"), quote(product, safe=""))
     boundary = "----visionboundary%d" % int(time.time() * 1000)
     parts = []
     parts.append(("--" + boundary).encode())
@@ -275,9 +357,10 @@ def post_frame_to_java(jpg_bytes, frame_count):
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         passed = data.get("passed")
-        set_tricolor(passed)   # OK→绿灯，NG→红灯
+        set_tricolor(passed)   # OK→绿灯，NG→红灯（灯同步线程随后维持该状态）
         with state_lock:
             stats["sent"] += 1
+            stats["result_for_item"] = stats["items"]   # 标记本件已出结果
             stats["last"] = {"passed": passed, "message": data.get("message"),
                              "screwMissing": data.get("screwMissing"),
                              "screwExpected": data.get("screwExpected"),
@@ -448,7 +531,8 @@ def main():
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--exposure", type=float, default=10000)
     ap.add_argument("--gain", type=float, default=1.0)
-    ap.add_argument("--product", type=str, required=True, help="产品编码，须与 Java 已注册标准图/示教一致")
+    ap.add_argument("--product", type=str, default=None,
+                    help="固定使用的配方编码；不填则自动跟随网页「工程配方」页启用的配方")
     ap.add_argument("--java-url", type=str, default="http://127.0.0.1:8088")
     ap.add_argument("--line", type=str, default="Line0", help="传感器输入线，如 Line0/Line1")
     ap.add_argument("--active-high", type=int, default=1, help="1=高电平有料，0=低电平有料")
@@ -461,6 +545,9 @@ def main():
     ap.add_argument("--leave-confirm", type=int, default=4, help="连续多少帧无料才确认工件离开(防抖)")
     ap.add_argument("--max-seconds", type=float, default=0,
                     help="单件最长采集秒数：传感器一直有料时，每满该秒数自动结束本件并开始新一件；0=不限(仅靠传感器分件)")
+    ap.add_argument("--max-width", type=int, default=1200,
+                    help="输出图像最大宽度：相机原始5120过大会让螺丝候选点暴增、配准不稳，"
+                         "在源头缩到此宽度(默认1200，螺丝约7px)。0=不缩放")
     ap.add_argument("--light", type=int, default=1, help="1=启用三色灯(继电器)，0=不控制")
     ap.add_argument("--relay-port", type=str, default="COM7", help="继电器模块串口，如 COM7")
     ap.add_argument("--relay-baud", type=int, default=9600, help="继电器波特率(常见9600/115200)")
@@ -470,8 +557,9 @@ def main():
 
     open_camera(CFG)
     relay_open()       # 打开继电器串口（三色灯）
-    light_selftest()   # 开机自检：绿灯→红灯各亮1秒，确认灯控制是否生效
+    light_selftest()   # 开机自检：黄→绿→红各亮1秒，确认灯控制是否生效
     threading.Thread(target=capture_loop, daemon=True).start()
+    threading.Thread(target=light_sync_loop, daemon=True).start()  # 三色灯跟随界面状态
     try:
         server = ThreadingHTTPServer(("127.0.0.1", CFG.port), Handler)
         print("采图服务已启动: http://127.0.0.1:%d  (/health /grab /status)" % CFG.port)

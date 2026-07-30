@@ -117,8 +117,9 @@ public class InspectController {
         if (!templateManager.templateExists(productCode)) {
             throw new IllegalArgumentException("产品未注册标准图: " + productCode);
         }
-        org.opencv.core.Mat template = org.opencv.imgcodecs.Imgcodecs.imread(
-                templateManager.getTemplateImagePath(productCode).toString());
+        // 用 ImageIoUtil 读取：OpenCV 原生 imread 在 Windows 下无法处理中文路径
+        org.opencv.core.Mat template = com.vision.inspect.detect.ImageIoUtil.read(
+                templateManager.getTemplateImagePath(productCode));
         try {
             InspectionSpec spec = specManager.load(productCode).orElse(new InspectionSpec());
             spec.setScrews(com.vision.inspect.detect.ScrewAutoDetector.detect(template, minR, maxR));

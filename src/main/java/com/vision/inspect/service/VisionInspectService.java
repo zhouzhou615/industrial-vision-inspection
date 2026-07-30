@@ -67,7 +67,7 @@ public class VisionInspectService {
         camera.softwareTrigger();
         Mat captured = grabWithRetry(camera);
 
-        Mat template = Imgcodecs.imread(templateManager.getTemplateImagePath(productCode).toString());
+        Mat template = com.vision.inspect.detect.ImageIoUtil.read(templateManager.getTemplateImagePath(productCode).toString());
         try {
             Optional<RoiRegion> roi = properties.getCompare().isEnableRoi()
                     ? safeLoadRoi(productCode)
@@ -129,11 +129,11 @@ public class VisionInspectService {
         if (!templateManager.templateExists(productCode)) {
             throw new IllegalArgumentException("产品未注册标准图: " + productCode);
         }
-        Mat captured = Imgcodecs.imread(imagePath.toString());
+        Mat captured = com.vision.inspect.detect.ImageIoUtil.read(imagePath.toString());
         if (captured.empty()) {
             throw new IllegalArgumentException("无法读取待测图片");
         }
-        Mat template = Imgcodecs.imread(templateManager.getTemplateImagePath(productCode).toString());
+        Mat template = com.vision.inspect.detect.ImageIoUtil.read(templateManager.getTemplateImagePath(productCode).toString());
         try {
             Optional<RoiRegion> roi = properties.getCompare().isEnableRoi()
                     ? safeLoadRoi(productCode)
@@ -201,7 +201,7 @@ public class VisionInspectService {
             Files.createDirectories(dir);
             String ts = LocalDateTime.now().format(TS);
             Path path = dir.resolve("capture_" + ts + ".jpg");
-            Imgcodecs.imwrite(path.toString(), captured);
+            com.vision.inspect.detect.ImageIoUtil.write(path, captured);
             return path;
         } catch (Exception e) {
             throw new IllegalStateException("保存采图失败", e);
@@ -217,7 +217,7 @@ public class VisionInspectService {
             Files.createDirectories(dir);
             String ts = LocalDateTime.now().format(TS);
             Path path = dir.resolve("diff_" + ts + ".jpg");
-            Imgcodecs.imwrite(path.toString(), score.getDiffImage());
+            com.vision.inspect.detect.ImageIoUtil.write(path, score.getDiffImage());
             score.getDiffImage().release();
             return path;
         } catch (Exception e) {

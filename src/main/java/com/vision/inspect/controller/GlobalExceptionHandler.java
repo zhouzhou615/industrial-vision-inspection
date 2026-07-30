@@ -30,6 +30,16 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.INTERNAL_SERVER_ERROR, e.getMessage());
     }
 
+    /**
+     * 客户端主动断开（浏览器刷新/切页导致图片请求被取消）不是服务端错误，
+     * 静默处理即可，否则实时预览会不断刷屏堆栈。
+     */
+    @ExceptionHandler({org.springframework.web.context.request.async.AsyncRequestNotUsableException.class,
+            org.apache.catalina.connector.ClientAbortException.class})
+    public void handleClientAbort(Exception e) {
+        log.debug("客户端已断开连接，忽略: {}", e.getMessage());
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handleOther(Exception e) {
         log.error("未处理异常", e);

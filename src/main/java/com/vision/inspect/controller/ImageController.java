@@ -27,10 +27,13 @@ public class ImageController {
 
     private final VisionProperties properties;
     private final TemplateManager templateManager;
+    private final com.vision.inspect.template.InspectionSpecManager specManager;
 
-    public ImageController(VisionProperties properties, TemplateManager templateManager) {
+    public ImageController(VisionProperties properties, TemplateManager templateManager,
+                           com.vision.inspect.template.InspectionSpecManager specManager) {
         this.properties = properties;
         this.templateManager = templateManager;
+        this.specManager = specManager;
     }
 
     /** 读取某产品的标准图 */
@@ -52,6 +55,71 @@ public class ImageController {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "非法路径");
         }
         return serve(target);
+    }
+
+    /**
+     * 标准图（带示教标注）：在标准图上画出该配方设置的螺丝位(青圈+编号)与 Logo 区(黄框)，
+     * 便于在「视觉检测」页直观看到本配方要检测哪些点位。
+     */
+    @GetMapping(value = "/template/{productCode}/marked", produces = MediaType.IMAGE_JPEG_VALUE)
+    public ResponseEntity<byte[]> templateMarked(@PathVariable String productCode) {
+        java.nio.file.Path tpl = templateManager.getTemplateImagePath(productCode);
+        if (!Files.exists(tpl)) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "标准图不存在");
+        }
+        org.opencv.core.Mat img = com.vision.inspect.detect.ImageIoUtil.read(tpl);
+        if (img.empty()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "标准图无法读取");
+        }
+        try {
+            com.vision.inspect.model.InspectionSpec spec =
+                    specManager.load(productCode).orElseGet(com.vision.inspect.model.InspectionSpec::new);
+            org.opencv.core.Mat marked =
+                    com.vision.inspect.detect.DefectAnnotator.annotate(img, java.util.List.of(), spec);
+            org.opencv.core.MatOfByte buf = new org.opencv.core.MatOfByte();
+            org.opencv.imgcodecs.Imgcodecs.imencode(".jpg", marked, buf);
+            byte[] bytes = buf.toArray();
+            buf.release();
+            marked.release();
+            return ResponseEntity.ok()
+                    .contentType(MediaType.IMAGE_JPEG)
+                    .cacheControl(org.springframework.http.CacheControl.noCache())
+                    .body(bytes);
+        } catch (Exception e) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "标注标准图失败");
+        } finally {
+            img.release();
+        }
+    }
+
+    /**
+     * 实时预览：代理相机采图服务的最新一帧，供“检测画面/图像采集”页实时显示。
+     */
+    @GetMapping(value = "/live", produces = MediaType.IMAGE_JPEG_VALUE)
+    public ResponseEntity<byte[]> live() {
+        try {
+            String url = properties.getCamera().getBridgeUrl() + "/grab";
+            java.net.HttpURLConnection conn =
+                    (java.net.HttpURLConnection) java.net.URI.create(url).toURL().openConnection();
+            conn.setConnectTimeout(1500);
+            conn.setReadTimeout(4000);
+            if (conn.getResponseCode() != 200) {
+                throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "采图服务无图像");
+            }
+            byte[] jpg;
+            try (java.io.InputStream in = conn.getInputStream()) {
+                jpg = in.readAllBytes();
+            }
+            conn.disconnect();
+            return ResponseEntity.ok()
+                    .contentType(MediaType.IMAGE_JPEG)
+                    .cacheControl(org.springframework.http.CacheControl.noCache())
+                    .body(jpg);
+        } catch (ResponseStatusException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "采图服务未连接");
+        }
     }
 
     private ResponseEntity<Resource> serve(Path path) {
