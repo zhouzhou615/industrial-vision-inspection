@@ -331,6 +331,8 @@ let running=false;       // 看板轮询
 let lastSeq=-1;
 let resultShown=false;   // 本件结果是否已展示（用于「进行中」状态切换）
 let lastItems=0;         // 采图服务的件号，用于识别“新一件开始”
+let lastSensor=false;    // 上次轮询的传感器状态，用于识别上升沿（待料→有料）
+let recipeTick=0;        // 状态轮询计数：配方查询按更低频率搭车，不必每 500ms 都查
 
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.className='toast show';setTimeout(()=>t.className='toast',2200);}
 function go(id,btn){
@@ -357,10 +359,16 @@ async function pollStatus(){
     document.getElementById('stCam').className='v '+(s.cameraConnected?'ok-t':'ng-t');
     document.getElementById('stTrig').textContent=s.sensorActive?'有料':'待料';
     document.getElementById('stTrig').className='v '+(s.sensorActive?'ok-t':'');
-    // 「进行中」：以采图服务的件号递增为准（传感器长期有料时也能正确切件）
+    // 「进行中」的触发时机：
+    //  1) 传感器<b>上升沿</b>（待料→有料）：这就是"新一件来了"，立刻切进行中。
+    //     不能只等件号递增 —— 件号要经 采图服务→Java→本页轮询 两跳才更新，
+    //     一件的检测往往已经结束了，进行中根本来不及显示。
+    //  2) 件号递增：传感器长期有料（台面调试/按节拍切件）时的兜底。
     const items=Number(s.bridgeItems||0);
+    const sensorRise=s.sensorActive&&!lastSensor;
+    lastSensor=!!s.sensorActive;
     if(items>lastItems){lastItems=items;resultShown=false;}
-    if(!s.sensorActive&&items===lastItems&&!resultShown){resultShown=false;}
+    if(sensorRise)resultShown=false;
     if(running&&!resultShown&&(s.sensorActive||items>0)){setBusy();}
     const dp=s.diskUsedPercent;
     document.getElementById('stDisk').textContent=`剩余${s.diskFreeGb}GB (已用${dp}%)`;
@@ -374,6 +382,8 @@ async function pollStatus(){
     document.getElementById('topRight').textContent=
       `配方 ${ACTIVE||'未启用'} ｜ 产量 ${s.total} ｜ 良率 ${s.yield}%`;
   }catch(e){}
+  // 配方不会频繁变，没必要跟着 500ms 的状态轮询一起查 —— 每 8 次(约4秒)查一次
+  if((++recipeTick % 8)!==1)return;
   // 同步当前启用配方，并让「标准」图跟随该配方（启用后立即换图，不必等检测结果）
   try{
     const a=await(await fetch(`${API}/recipe/active`)).json();
@@ -693,7 +703,9 @@ async function resetStat(){await fetch(`${API}/inspect/line/reset`,{method:'POST
 setMode('screw');
 loadSettings();
 pollStatus();
-setInterval(pollStatus,2000);
+// 500ms：要靠这个轮询抓传感器上升沿来显示「进行中」。原来 2000ms 时，
+// 一个 1 秒走过的工件的高电平可能整个落在两次轮询之间，上升沿根本看不到。
+setInterval(pollStatus,500);
 setInterval(pollLine,1000);
 setInterval(tickVisionLive,800);
 </script>

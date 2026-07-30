@@ -460,14 +460,47 @@ def _post_and_release(jpg_bytes, frame_count):
         post_busy.release()
 
 
+def _send_for_detect(best_gray, frames):
+    """
+    把一帧交给后台线程送去 Java 检测，返回是否真的发出去了（不打日志，由调用方决定）。
+
+    <b>同一时刻只允许一个在途请求</b>（post_busy 信号量）：Java 单件检测约 300ms，
+    不限流会越堆越多、最后全部超时。
+    注意<b>先抢信号量再编码</b>：抢不到就直接返回，省掉一次白做的 JPEG 编码
+    —— stream 模式下这个判断每秒会走好几次。
+    """
+    if not post_busy.acquire(blocking=False):
+        return False
+    try:
+        okj, encj = cv2.imencode(".jpg", best_gray, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        if not okj:
+            post_busy.release()
+            return False
+        threading.Thread(target=_post_and_release,
+                         args=(encj.tobytes(), frames), daemon=True).start()
+        return True
+    except Exception:
+        post_busy.release()
+        raise
+
+
 def capture_loop():
     """
     连续取帧 + 分件状态机。
 
-    <b>分件依据由 --gate 决定：</b>
+    这里有<b>两个相互独立</b>的判据，别混在一起：
+
+    <b>--gate 决定"什么时候采图"</b>（本件正在进行时，哪些帧算数）：
       vision  只看画面：工件<b>完整进入视野</b>才开始采集，开始<b>离开视野</b>就结束本件（默认）
       sensor  只看光电传感器 LineStatus（原有行为）
       both    两者同时满足才采集（传感器定位置、视觉保证完整）
+
+    <b>--rearm 决定"什么时候算下一件"</b>（上一件结束后如何解锁）：
+      sensor  传感器先无料、再有料 = 下一件（默认，符合产线语义）
+      vision  工件完全离开画面 = 下一件
+
+    为什么要拆开：工件停在视野里不动时，画面永远不会"清空"，若用视野清场分件就会
+    第一件之后再也不检测；而传感器的下降沿+上升沿才是真正的"换了一件"。
     """
     global latest_jpeg, fov_jpeg, sensor_active, fov_now, fov_box_now
     present = False
@@ -477,8 +510,14 @@ def capture_loop():
     active_streak = 0      # 连续"在检测区"计数（进入防抖）
     inactive_streak = 0    # 连续"不在检测区"计数（离开防抖）
     item_start = 0.0       # 本件开始采集的时间戳（用于最长采集时长切件）
-    need_clear = False     # 本件因"工件离开"结束后，要求先看到工件完全离开画面再接下一件
+    need_clear = False     # 本件因"工件离开"结束后，要求先"清场"再接下一件（清场条件见 --rearm）
     last_state = None      # 上一帧的视野状态，用于只在变化时打日志
+    sensor_unreadable_warned = False   # 传感器读不到时只警告一次，避免刷屏
+    seg_frames = 0         # 距上次送检又攒了多少可用帧（stream 模式分段选最清晰帧）
+    sent_in_item = 0       # 本件已送检次数
+    last_detect = 0.0      # 本件内上次送检的时间戳
+    last_preview = 0.0     # 上次编码 /grab 预览图的时间戳
+    last_overlay = 0.0     # 上次编码 /fov 调试图的时间戳
 
     while True:
         st_frame = MV_FRAME_OUT()
@@ -489,13 +528,19 @@ def capture_loop():
             continue
         try:
             gray = frame_to_gray(st_frame)
-            # 更新 /grab 用的最新帧（低频编码即可，这里每帧都编码方便调试）
-            ok, enc = cv2.imencode(".jpg", gray, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            if ok:
-                with state_lock:
-                    latest_jpeg = enc.tobytes()
+            now = time.time()
+            # /grab 预览图：<b>限流编码</b>。JPEG 编码一张 1200x1200 有实打实的开销，
+            # 而预览只是给人看的，每秒几张足够。原先每帧都编码，白占掉本可以用来
+            # 多采几帧工件的 CPU（工件完整露出的窗口很短，帧率就是有效样本数）。
+            if now - last_preview >= CFG.preview_interval:
+                ok, enc = cv2.imencode(".jpg", gray, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if ok:
+                    with state_lock:
+                        latest_jpeg = enc.tobytes()
+                last_preview = now
 
-            sensor = read_line_status()
+            sensor_raw = read_line_status()   # None = 读不到（未接/不支持），下面按"一直有料"退化
+            sensor = sensor_raw
             if sensor is None:
                 sensor = True  # 读不到传感器时，退化为“一直有料”（可用 /grab 手动）
 
@@ -512,33 +557,59 @@ def capture_loop():
                     else:
                         print("  视野状态 %s -> %s (未检出工件)" % (last_state, state))
                     last_state = state
-                if CFG.fov_debug:
+                # /fov 调试图同样限流：它要画框再编码一次 JPEG，每帧都做很吃 CPU
+                if CFG.fov_debug and now - last_overlay >= CFG.preview_interval:
                     dbg = fov_overlay_jpeg(gray, state, box)
                     if dbg:
                         with state_lock:
                             fov_jpeg = dbg
+                    last_overlay = now
 
             with state_lock:
                 sensor_active = sensor
                 fov_now = state
                 fov_box_now = box
 
-            # 是否"在检测区"（可采集）：按门控方式组合两个条件
+            # ==== 两个<b>互不干扰</b>的信号 ====
+            # item_on  = "一件正在进行"     —— 决定何时开始/结束一件（分件）
+            # frame_ok = "这一帧可用于判定" —— 决定本件进行中哪些帧参与选最清晰帧（采图）
+            #
+            # 必须分开：视野状态会因为工件在边界上抖动、Otsu 把桌面/杂物当亮区而频繁跳变
+            # （实测同一块板子逐帧框出 258x525、678x161 这种离谱结果）。
+            # 若让视野去管分件，抖一下就结束本件；而它作为"帧过滤"是完全够用的
+            # —— 视野不完整的帧图像本身就不全，不该拿去判定。
+            if CFG.gate == "vision":
+                item_on = (state == FOV_FULL)      # 兼容旧行为：纯视觉分件
+            else:                                  # sensor / both
+                item_on = sensor                   # 传感器管开始与结束
             if CFG.gate == "sensor":
-                active = sensor
-            elif CFG.gate == "both":
-                active = sensor and (state == FOV_FULL)
-            else:                                  # vision
-                active = (state == FOV_FULL)
+                frame_ok = True                    # 不做视野过滤，整个有料期间的帧都算
+            else:                                  # vision / both
+                frame_ok = (state == FOV_FULL)
 
-            # 工件已完全离开画面 → 解除"等待清场"，允许接下一件
-            if need_clear and state == FOV_NONE:
+            # 传感器读不到却指望它分件 → 会永久没有工件，明确告警并退回视觉分件
+            if CFG.gate != "vision" and sensor_raw is None and not sensor_unreadable_warned:
+                print("警告: --gate %s 需要传感器分件，但读不到 LineStatus，"
+                      "已退化为「一直有料」。请检查 --line/--active-high/接线；"
+                      "台面调试可加 --max-seconds 3 按节拍切件。" % CFG.gate)
+                sensor_unreadable_warned = True
+
+            # 仅 --gate vision 才需要"清场"：视觉分件时工件后半截在画面里晃动会重复计件。
+            # 传感器分件不需要 —— 下降沿本身就是无歧义的分界，结果一出来就能接下一件。
+            if CFG.gate == "vision":
+                if need_clear:
+                    if CFG.rearm == "sensor" and sensor_raw is not None:
+                        if not sensor_raw:
+                            need_clear = False
+                    elif state == FOV_NONE:
+                        need_clear = False
+                if need_clear:
+                    item_on = False
+            else:
                 need_clear = False
-            if need_clear:
-                active = False                     # 清场前不许开始新一件
 
-            # 连续计数做防抖
-            if active:
+            # 连续计数做防抖（只对"分件"信号做，帧过滤不需要防抖）
+            if item_on:
                 active_streak += 1
                 inactive_streak = 0
             else:
@@ -552,61 +623,87 @@ def capture_loop():
                     best_gray = None
                     best_sharp = -1.0
                     frame_count = 0
+                    seg_frames = 0
+                    sent_in_item = 0
+                    last_detect = 0.0
                     item_start = time.time()
                     with state_lock:
                         stats["items"] += 1
                     set_tricolor(None)  # 工件进入→黄灯(运行中)，结果出来再变绿/红
-                    print("[件#%d] 工件已完整进入视野，开始采集…" % stats["items"])
+                    print("[件#%d] %s，开始采集…" % (
+                        stats["items"],
+                        "工件已完整进入视野" if CFG.gate == "vision" else "传感器有料"))
             else:
-                # 工件完整在视野内：累计最清晰帧（短暂抖动不结束）
-                if active:
+                # 本件进行中：只把"视野完整"的帧拿去比清晰度。
+                # 视野中途抖到 partial 只是这几帧不算，<b>不结束本件</b>。
+                if frame_ok:
                     frame_count += 1
+                    seg_frames += 1
                     s = sharpness(gray)
                     if s > best_sharp:
                         best_sharp = s
                         best_gray = gray.copy()
 
+                # --detect-mode stream: 工件完整露出的窗口往往很短，不等本件结束就边采边送检。
+                # 每 --detect-interval 毫秒送一次"这一小段里最清晰的一帧"，本件最多送
+                # --detect-max 次。送完立刻重挑下一段的最清晰帧，避免整件都盯着同一张。
+                if (CFG.detect_mode == "stream" and frame_ok and best_gray is not None
+                        and seg_frames >= CFG.min_frames
+                        and (CFG.detect_max <= 0 or sent_in_item < CFG.detect_max)
+                        and (now - last_detect) * 1000.0 >= CFG.detect_interval):
+                    if _send_for_detect(best_gray, seg_frames):
+                        sent_in_item += 1
+                        best_gray = None      # 下一段重新挑最清晰帧
+                        best_sharp = -1.0
+                        seg_frames = 0
+                    # 成功与否都推进计时：Java 在忙时按同样间隔重试即可。
+                    # 否则会每帧都试一次 —— 25fps 下就是每秒 25 次无谓尝试。
+                    last_detect = now
+
                 # 结束本件的两种情形：
-                #  a) 工件开始离开视野 / 传感器无料（视门控方式而定）
+                #  a) 分件信号消失（传感器无料 / 纯视觉模式下工件离开视野）
                 #  b) 采集时长达到上限（工件长时间静止不动时按固定节拍切件，便于台面调试）
                 leave = inactive_streak >= CFG.leave_confirm
                 timeout = CFG.max_seconds > 0 and (time.time() - item_start) >= CFG.max_seconds
                 if leave or timeout:
                     if leave:
-                        reason = ("工件开始离开视野" if CFG.gate != "sensor" else "传感器无料")
+                        reason = ("工件离开视野" if CFG.gate == "vision" else "传感器无料")
                     else:
                         reason = "采集达 %.0f 秒" % CFG.max_seconds
-                    print("[件#%d] %s，结束本件" % (stats["items"], reason))
-                    if frame_count >= CFG.min_frames and best_gray is not None:
-                        okj, encj = cv2.imencode(".jpg", best_gray,
-                                                 [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-                        if okj:
-                            jpg = encj.tobytes()
-                            fc = frame_count
-                            # 同一时刻只发一个检测请求：Java 还在忙就跳过本件，避免堆积超时
-                            if post_busy.acquire(blocking=False):
-                                threading.Thread(target=_post_and_release,
-                                                 args=(jpg, fc), daemon=True).start()
-                            else:
-                                print("[件#%d] Java 检测繁忙，跳过本件" % stats["items"])
-                    elif frame_count > 0:
-                        print("[件#%d] 采集帧数不足(%d)，丢弃" % (stats["items"], frame_count))
+                    print("[件#%d] %s，结束本件(可用%d帧，已送检%d次)"
+                          % (stats["items"], reason, frame_count, sent_in_item))
+                    # 收尾再送一次：把最后一段（上次送检之后攒的帧）也检一遍。
+                    # stream 模式下若这一段帧数不够就不送，避免拿零星几帧凑一次检测。
+                    if best_gray is not None and seg_frames >= CFG.min_frames:
+                        if not _send_for_detect(best_gray, seg_frames):
+                            print("[件#%d] Java 检测繁忙，收尾这次送检跳过"
+                                  % stats["items"])
+                    elif sent_in_item == 0:
+                        if frame_count > 0:
+                            print("[件#%d] 可用帧不足(%d<%d)，丢弃。视野一直不完整？"
+                                  % (stats["items"], frame_count, CFG.min_frames))
+                        else:
+                            print("[件#%d] 整件期间视野都不完整，无可用帧，丢弃"
+                                  % stats["items"])
 
-                    if timeout and active:
-                        # 工件仍完整在视野内（台面静止调试）：立刻作为“新一件”继续，实现连续循环检测
+                    if timeout and item_on:
+                        # 分件信号还在（台面静止调试）：立刻作为“新一件”继续，实现连续循环检测
                         best_gray = None
                         best_sharp = -1.0
                         frame_count = 0
+                        seg_frames = 0
+                        sent_in_item = 0
+                        last_detect = 0.0
                         item_start = time.time()
                         with state_lock:
                             stats["items"] += 1
-                        print("[件#%d] 工件仍在视野内，开始新一件采集…" % stats["items"])
+                        print("[件#%d] 分件信号仍在，开始新一件采集…" % stats["items"])
                     else:
                         present = False
-                        # 因离开而结束：要求先看到工件<b>完全离开画面</b>再接下一件。
-                        # 否则工件的后半截还在画面里晃动时可能又满足一次"完整进入"，
-                        # 同一个工件被检测两次。
-                        if leave and CFG.gate != "sensor":
+                        # 只有纯视觉分件才需要"清场"：工件后半截在画面里晃动会重复计件。
+                        # 传感器分件不需要 —— 无料就是分界，下次有料立刻就是新一件，
+                        # 结果一出来就能接下一件，不用等画面清空。
+                        if leave and CFG.gate == "vision":
                             need_clear = True
         except Exception as e:
             # 单帧异常不许搞垮整个采图线程（7×24 稳定性）
@@ -687,9 +784,12 @@ def main():
     ap.add_argument("--java-url", type=str, default="http://127.0.0.1:8088")
     ap.add_argument("--line", type=str, default="Line0", help="传感器输入线，如 Line0/Line1")
     ap.add_argument("--active-high", type=int, default=1, help="1=高电平有料，0=低电平有料")
-    ap.add_argument("--gate", type=str, default="vision", choices=["vision", "sensor", "both"],
-                    help="分件依据：vision=工件完整进入视野才采(默认)；sensor=只看光电传感器；"
-                         "both=两者同时满足")
+    ap.add_argument("--gate", type=str, default="both", choices=["vision", "sensor", "both"],
+                    help="分件与采图的判据组合（推荐 both）："
+                         "both=传感器管一件的开始/结束，视野只用来筛掉不完整的帧(默认)；"
+                         "sensor=传感器管开始/结束，不做视野筛帧；"
+                         "vision=纯视觉分件(工件完整进入才开始、离开就结束)，"
+                         "台面上工件不走时需配合 --rearm/--max-seconds")
     ap.add_argument("--fov-margin", type=int, default=12,
                     help="视野余量(像素)：工件外接框四边都离画面边界至少这么远，才算「完整进入」。"
                          "太小会在齐边时反复跳状态，太大则工件要离边界很远才肯采图")
@@ -701,7 +801,28 @@ def main():
     ap.add_argument("--strobe-line", type=str, default="Line1", help="补光灯所接的相机输出线，如 Line1/Line2")
     ap.add_argument("--strobe-duration", type=int, default=0, help="频闪脉宽(微秒)，0=跟随曝光时长")
     ap.add_argument("--strobe-delay", type=int, default=0, help="频闪延迟(微秒)")
-    ap.add_argument("--min-frames", type=int, default=3, help="一件至少采集多少帧才判定")
+    ap.add_argument("--rearm", type=str, default="sensor", choices=["sensor", "vision"],
+                    help="一件结束后靠什么解锁下一件（与 --gate 相互独立：--gate 决定何时采图，"
+                         "--rearm 决定何时算新的一件）。"
+                         "sensor=传感器先无料、再有料就是下一件(推荐，工件停在视野里也能分件)；"
+                         "vision=工件完全离开画面才算下一件(台面调试时工件不走，会卡住)")
+    ap.add_argument("--detect-mode", type=str, default="end", choices=["end", "stream"],
+                    help="何时送检：end=本件结束时只送最清晰的一帧(默认)；"
+                         "stream=本件进行中边采边送，工件完整露出的窗口很短时用这个，"
+                         "能在窗口内拿到多次检测结果")
+    ap.add_argument("--detect-interval", type=float, default=250,
+                    help="stream 模式下两次送检的最小间隔(毫秒)。Java 单件约 300ms，"
+                         "设太小只会被在途限流挡掉，没有意义")
+    ap.add_argument("--detect-max", type=int, default=3,
+                    help="stream 模式下单件最多送检几次，0=不限。注意每次送检在网页统计里"
+                         "都算一次检测，会放大产量计数")
+    ap.add_argument("--preview-interval", type=float, default=0.2,
+                    help="/grab 与 /fov 预览图的编码间隔(秒)。预览只是给人看的，"
+                         "调大可把 CPU 留给多采几帧工件")
+    ap.add_argument("--min-frames", type=int, default=2,
+                    help="一件至少要有多少「视野完整」的帧才判定，少于此数丢弃。"
+                         "工件走得快、完整露出的窗口只有零点几秒时，可用帧本来就不多，"
+                         "设 3 会把大量本可判定的工件丢掉；2 帧已够挑出较清晰的一张")
     ap.add_argument("--enter-confirm", type=int, default=3,
                     help="连续多少帧满足条件才确认工件进入(防抖)。工件速度快时调小，否则会错过完整进入的窗口")
     ap.add_argument("--leave-confirm", type=int, default=4,
@@ -719,10 +840,26 @@ def main():
     CFG = ap.parse_args()
     CFG.active_high = bool(CFG.active_high)
     CFG.fov_debug = bool(CFG.fov_debug)
-    print("分件依据: --gate %s%s" % (
-        CFG.gate,
-        ("（工件外接框四边距画面边界 ≥%dpx 且面积占比 ≥%.1f%% 才算完整进入）"
-         % (CFG.fov_margin, CFG.fov_min_area * 100)) if CFG.gate != "sensor" else ""))
+    if CFG.gate == "vision":
+        print("分件依据: 视野（工件完整进入=开始，离开=结束）")
+        print("解锁下一件: --rearm %s（%s）" % (
+            CFG.rearm,
+            "传感器先无料、再有料" if CFG.rearm == "sensor" else "工件完全离开画面"))
+    else:
+        print("分件依据: 传感器 %s（有料=开始一件，无料=结束本件；结果一出即可接下一件）"
+              % CFG.line)
+    if CFG.detect_mode == "stream":
+        print("送检方式: stream（本件进行中每 %.0fms 送一次，最多 %s 次；"
+              "注意网页产量按检测次数计）"
+              % (CFG.detect_interval, "不限" if CFG.detect_max <= 0 else CFG.detect_max))
+    else:
+        print("送检方式: end（本件结束时送最清晰的一帧）")
+    if CFG.gate == "sensor":
+        print("采图筛帧: 不筛（有料期间所有帧都参与选最清晰帧）")
+    else:
+        print("采图筛帧: 视野完整的帧才参与（外接框四边距边界 ≥%dpx 且面积占比 ≥%.1f%%）；"
+              "视野中途抖动只是丢几帧，不会结束本件"
+              % (CFG.fov_margin, CFG.fov_min_area * 100))
 
     open_camera(CFG)
     relay_open()       # 打开继电器串口（三色灯）
